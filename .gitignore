@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated datasets / build outputs
+out_smoke/
+out_smoke_*/
+gw_synthetic_dataset/
+*.npy
+*.png
+
+# Allow committing reference/sample images if ever placed under docs/
+!docs/**/*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

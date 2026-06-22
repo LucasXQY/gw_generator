@@ -1,0 +1,11 @@
+# Core (required) — the full pipeline and tests run on these alone.
+numpy
+scipy
+matplotlib
+pillow
+
+# Optional scientific stack (physical waveforms + true Q-transform).
+# Install in a conda env (e.g. conda activate gw-yolo); the builder falls back
+# to an analytic chirp + scipy spectrogram when these are absent.
+# pycbc
+# gwpy
