@@ -312,7 +312,7 @@ class DatasetConfig:
     drop_label_if_outside_window: bool = True
 
     # --------------------------------------------------------------- Q-transform
-    qtransform_backend: str = "scipy"  # "scipy" or "gwpy"
+    qtransform_backend: str = "gwpy"  # "gwpy" (LIGO Omega Q-scan) or "scipy" (CQT)
     qtransform_image_width: int = 640
     qtransform_image_height: int = 640
     qtransform_display_dpi: int = 100

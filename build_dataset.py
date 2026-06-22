@@ -450,7 +450,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--frequency-axis-scale", choices=["log", "linear"], default=None,
                    help="(ignored) frequency axis is fixed to linear")
     p.add_argument("--output-dir", default="gw_synthetic_dataset")
-    p.add_argument("--qtransform-backend", choices=["scipy", "gwpy"], default="scipy")
+    p.add_argument("--qtransform-backend", choices=["gwpy", "scipy"], default="gwpy",
+                   help="gwpy = LIGO Omega Q-scan (default); scipy = built-in constant-Q")
     p.add_argument("--image-width", type=int, default=640)
     p.add_argument("--image-height", type=int, default=640)
     p.add_argument("--seed", type=int, default=42)

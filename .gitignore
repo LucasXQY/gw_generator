@@ -12,9 +12,10 @@ venv/
 env/
 
 # Generated datasets / build outputs
-out_smoke/
-out_smoke_*/
+out_*/
 gw_synthetic_dataset/
+gw_dataset*/
+pilot*/
 *.npy
 *.png
 

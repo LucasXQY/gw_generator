@@ -16,6 +16,23 @@ import numpy as np
 from config import DatasetConfig
 
 
+def _aligo_asd(freqs: np.ndarray) -> np.ndarray:
+    """Analytic Advanced-LIGO amplitude spectral density (arbitrary units).
+
+    Uses the standard dimensionless fit (Ajith 2011) with f0 = 215 Hz, floored
+    below 20 Hz (the seismic wall) to avoid a divergent DC term.
+    """
+    f = np.asarray(freqs, dtype=float).copy()
+    f = np.where(f < 20.0, 20.0, f)  # floor the seismic wall
+    x = f / 215.0
+    psd = x ** (-4.14) - 5.0 * x ** (-2.0) + 111.0 * (
+        1.0 - x ** 2 + 0.5 * x ** 4
+    ) / (1.0 + 0.5 * x ** 2)
+    psd = np.clip(psd, 1e-3, None)
+    asd = np.sqrt(psd)
+    return asd / np.median(asd)  # normalize scale
+
+
 @dataclass
 class NoiseRealization:
     series: np.ndarray
@@ -42,21 +59,29 @@ class NoiseGenerator:
         self._glitch_counter = 0
 
     def background_noise(self, rng: np.random.Generator) -> NoiseRealization:
-        """An independent coloured-ish Gaussian background realization."""
+        """An independent Gaussian background coloured by an analytic aLIGO PSD.
+
+        Colouring (seismic wall at low f, sensitivity bucket near ~200-300 Hz,
+        shot noise rising at high f) makes the *raw* Q-transform look like real
+        detector data, while whitening flattens it for the *normalized* image.
+        """
         n = self.config.n_samples
-        # White Gaussian with a mild low-frequency tilt to look detector-like.
+        sr = self.config.sample_rate
+
+        freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+        asd = _aligo_asd(freqs)
+
+        # White Gaussian -> colour in the frequency domain -> back to time.
         white = rng.standard_normal(n)
-        # 1/f-ish colouring via cumulative blending (cheap, stable, seedable).
-        colored = white.copy()
-        alpha = 0.05
-        for _ in range(2):
-            colored = colored + alpha * np.concatenate([[0.0], colored[:-1]])
+        spec = np.fft.rfft(white) * asd
+        colored = np.fft.irfft(spec, n=n)
         colored = colored / (np.std(colored) + 1e-12)
+
         self._noise_counter += 1
         return NoiseRealization(
             series=colored.astype(float),
             noise_id=f"noise_{self._noise_counter:08d}",
-            noise_type="gaussian",
+            noise_type="gaussian_aligo_colored",
         )
 
     def sample_glitch(self, rng: np.random.Generator) -> GlitchRealization:

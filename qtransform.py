@@ -27,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from config import DatasetConfig  # noqa: E402
+from config import DatasetConfig, MissingOptionalDependency  # noqa: E402
 from coords import image_row_frequencies  # noqa: E402
 
 
@@ -109,15 +109,54 @@ class QTransformRenderer:
         strain = np.asarray(strain, dtype=float)
 
         if cfg.qtransform_backend == "gwpy":
-            grid = self._gwpy_energy(strain)
-            if grid is not None:
-                return grid
-            warnings.warn(
-                "gwpy backend unavailable; falling back to the scipy spectrogram.",
-                RuntimeWarning,
-            )
+            # Explicitly selected -> use GWpy's Q-transform, surface errors.
+            return self._gwpy_energy(strain)
 
-        return self._scipy_energy(strain)
+        try:
+            return self._cqt_energy(strain)
+        except Exception:
+            return self._scipy_energy(strain)
+
+    def _cqt_energy(self, strain: np.ndarray) -> np.ndarray:
+        """Constant-Q (Morlet/Gaussian filterbank) energy on the image grid.
+
+        Each image frequency row is a Gaussian band-pass of bandwidth f/Q,
+        normalized so white noise gives a flat response (so background colour
+        comes from the noise PSD, not the filter bandwidth). This yields the
+        clean, adaptive-resolution tracks of a real Q-transform instead of the
+        blocky fixed-resolution STFT.
+        """
+        cfg = self.config
+        sr = cfg.sample_rate
+        strain = np.asarray(strain, dtype=float)
+        n = strain.shape[0]
+
+        target_f = image_row_frequencies(
+            self.height, cfg.frange_low, cfg.frange_high, cfg.frequency_axis_scale
+        )
+        centers = np.clip(target_f, 8.0, None)  # wavelet centre needs f > 0
+        q = float(np.sqrt(cfg.qrange_low * cfg.qrange_high))
+
+        full_freqs = np.fft.fftfreq(n, d=1.0 / sr)
+        strain_fft = np.fft.fft(strain)
+        t_full = np.arange(n) / sr
+        target_t = np.linspace(0.0, cfg.duration, self.width)
+
+        energy = np.empty((self.height, self.width))
+        block = 64  # bound peak memory
+        for s in range(0, self.height, block):
+            rows = centers[s : s + block]
+            sigma_f = rows / q
+            win = np.exp(
+                -0.5 * ((full_freqs[None, :] - rows[:, None]) / sigma_f[:, None]) ** 2
+            )
+            # Normalize each filter so filtered white noise has flat variance.
+            win /= np.sqrt(np.sum(win ** 2, axis=1, keepdims=True)) + 1e-12
+            analytic = np.fft.ifft(strain_fft[None, :] * win, axis=1)
+            power = np.abs(analytic) ** 2
+            for j in range(power.shape[0]):
+                energy[s + j, :] = np.interp(target_t, t_full, power[j])
+        return np.clip(energy, 0.0, None)
 
     def _scipy_energy(self, strain: np.ndarray) -> np.ndarray:
         cfg = self.config
@@ -169,36 +208,60 @@ class QTransformRenderer:
             grid[i, :] = np.interp(target_t, t, freq_interp[i, :])
         return np.clip(grid, 0.0, None)
 
-    def _gwpy_energy(self, strain: np.ndarray) -> Optional[np.ndarray]:
+    def _gwpy_energy(self, strain: np.ndarray) -> np.ndarray:
+        """GWpy's tiled constant-Q transform (the LIGO/Virgo Omega Q-scan).
+
+        Returns gwpy's *normalized energy* mapped onto the fixed linear 0-1000 Hz
+        image grid. Raises a clear error if gwpy is unavailable.
+        """
         cfg = self.config
         try:
             from gwpy.timeseries import TimeSeries
+        except Exception as exc:
+            raise MissingOptionalDependency(
+                "gwpy is required for --qtransform-backend gwpy. Install it "
+                "(`pip install gwpy` or `conda install -c conda-forge gwpy`) or "
+                "use --qtransform-backend scipy."
+            ) from exc
 
-            ts = TimeSeries(strain, sample_rate=cfg.sample_rate)
-            qgram = ts.q_transform(
-                qrange=cfg.qrange,
-                frange=cfg.frange,
-                outseg=None,
-                whiten=False,
-            )
-            f = np.asarray(qgram.frequencies.value)
-            t = np.asarray(qgram.times.value) - float(qgram.times.value[0])
-            sxx = np.asarray(qgram.value).T  # gwpy is (time, freq)
-            return self._resample_to_grid(f, t, sxx)
-        except Exception:
-            return None
+        ts = TimeSeries(strain, sample_rate=cfg.sample_rate)
+        # gwpy uses log-spaced constant-Q tiles, so the low edge must be > 0.
+        # We map the result onto the fixed linear 0-1000 image grid afterwards.
+        gw_low = max(cfg.frange_low, 10.0)
+        qgram = ts.q_transform(
+            qrange=cfg.qrange,
+            frange=(gw_low, cfg.frange_high),
+            whiten=False,
+        )
+        f = np.asarray(qgram.frequencies.value)
+        t = np.asarray(qgram.times.value) - float(qgram.times.value[0])
+        sxx = np.asarray(qgram.value).T  # gwpy is (time, freq)
+        return self._resample_to_grid(f, t, sxx)
 
     # --------------------------------------------------------------- render
     def energy_stats(self, strain: np.ndarray) -> EnergyStats:
         cfg = self.config
         raw = self._raw_energy(strain)
-        normalized, meta = normalize_energy_map(
-            raw,
-            method=cfg.energy_norm_method,
-            vmax=cfg.energy_vmax,
-            vmin=cfg.energy_vmin,
-            percentile=cfg.energy_percentile,
-        )
+        if cfg.qtransform_backend == "gwpy":
+            # gwpy already returns *normalized energy*; just clip to the fixed
+            # 0-25 display scale (the canonical Omega Q-scan colorbar).
+            peak = float(np.max(raw)) if raw.size else 0.0
+            normalized = np.clip(raw, cfg.energy_vmin, cfg.energy_vmax)
+            meta = {
+                "energy_norm_method": "gwpy_normalized_energy",
+                "energy_vmin": float(cfg.energy_vmin),
+                "energy_vmax": float(cfg.energy_vmax),
+                "energy_peak": peak,
+                "energy_percentile_used": "",
+            }
+        else:
+            normalized, meta = normalize_energy_map(
+                raw,
+                method=cfg.energy_norm_method,
+                vmax=cfg.energy_vmax,
+                vmin=cfg.energy_vmin,
+                percentile=cfg.energy_percentile,
+            )
         target_f = image_row_frequencies(
             self.height, cfg.frange_low, cfg.frange_high, cfg.frequency_axis_scale
         )
