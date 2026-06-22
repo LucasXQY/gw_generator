@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -71,6 +73,19 @@ def _fmt(value) -> str:
         return str(value)
 
 
+def _chirp_derived(params: Dict[str, object]) -> Tuple[float, float, float, float]:
+    """Return (chirp_mass, total_mass, mass_ratio, chi_eff) from intrinsic params."""
+    m1 = float(params["mass1"])
+    m2 = float(params["mass2"])
+    s1 = float(params.get("spin1z", 0.0) or 0.0)
+    s2 = float(params.get("spin2z", 0.0) or 0.0)
+    total = m1 + m2
+    chirp_mass = (m1 * m2) ** 0.6 / total ** 0.2
+    mass_ratio = min(m1, m2) / max(m1, m2)
+    chi_eff = (m1 * s1 + m2 * s2) / total
+    return chirp_mass, total, mass_ratio, chi_eff
+
+
 def _bandlimit(signal: np.ndarray, sample_rate: int, flo: float, fhi: float) -> np.ndarray:
     """FFT band-limit a waveform to [flo, fhi] (low-pass when flo <= 0).
 
@@ -105,39 +120,63 @@ class DatasetBuilder:
         )
         self.root = Path(config.output_dir)
         self._meta_rows: List[dict] = []
-        self._event_rows: List[dict] = []
         self._sample_info: List[dict] = []
+        self._match_rows: List[dict] = []
+        self._negative_rows: List[dict] = []
+        self._pair_rows: List[dict] = []
 
     # ------------------------------------------------------------------ build
     def build(self) -> Path:
         self._prepare_directories()
+        self._write_dataset_config()
         split_assignment = self._event_split_assignment()
 
-        for index, split in enumerate(split_assignment):
-            self._build_event(index, split)
+        meta_path = self.root / "metadata.csv"
+        event_path = self.root / "event_metadata.csv"
+        completed = False
 
+        # Stream metadata + event rows per event (flushed), so an interrupted or
+        # failed run still leaves usable CSVs for the events already generated.
+        with meta_path.open("w", newline="", encoding="utf-8") as mh, \
+                event_path.open("w", newline="", encoding="utf-8") as eh:
+            meta_writer = csv.DictWriter(mh, fieldnames=METADATA_FIELDS)
+            event_writer = csv.DictWriter(eh, fieldnames=EVENT_FIELDS)
+            meta_writer.writeheader()
+            event_writer.writeheader()
+            try:
+                for index, split in enumerate(split_assignment):
+                    self._build_event(index, split, meta_writer, event_writer)
+                    mh.flush()
+                    eh.flush()
+                completed = True
+            finally:
+                # Always write pairs + configs from whatever completed, so a
+                # partial run is still a coherent (smaller) dataset.
+                self._write_pairs_and_config()
+
+        # Validate only a fully completed run.
+        if completed:
+            run_all_validations(
+                self._meta_rows,
+                self._match_rows,
+                self._negative_rows,
+                self._pair_rows,
+                allow_cross_split=self.config.allow_cross_split_negative_pairs,
+            )
+        return meta_path
+
+    def _write_pairs_and_config(self) -> None:
         # Pairs are built within each split (leakage-safe).
         pair_builder = PairBuilder(self.config, self.rng)
         match_rows, negative_rows, pair_rows = pair_builder.generate(self._sample_info)
-
-        self._write_csv("metadata.csv", METADATA_FIELDS, self._meta_rows)
-        self._write_csv("event_metadata.csv", EVENT_FIELDS, self._event_rows)
+        self._match_rows, self._negative_rows, self._pair_rows = (
+            match_rows, negative_rows, pair_rows,
+        )
         self._write_csv("match_pairs.csv", MATCH_FIELDS, match_rows)
         self._write_csv("negative_pairs.csv", NEGATIVE_FIELDS, negative_rows)
         self._write_csv("pair_metadata.csv", PAIR_FIELDS, pair_rows)
-
         write_task_protocols(self.config, self.root)
         write_gw_data_yaml(self.config, self.root)
-
-        # Validate before reporting success.
-        run_all_validations(
-            self._meta_rows,
-            match_rows,
-            negative_rows,
-            pair_rows,
-            allow_cross_split=self.config.allow_cross_split_negative_pairs,
-        )
-        return self.root / "metadata.csv"
 
     # ----------------------------------------------------------- event split
     def _event_split_assignment(self) -> List[str]:
@@ -157,7 +196,7 @@ class DatasetBuilder:
         return seq
 
     # ------------------------------------------------------------ one event
-    def _build_event(self, index: int, split: str) -> None:
+    def _build_event(self, index: int, split: str, meta_writer, event_writer) -> None:
         cfg = self.config
         rng = self.rng
 
@@ -174,9 +213,14 @@ class DatasetBuilder:
         base_target_snr = None
         injection_time_value = None
         sig_duration = 0.0
+        waveform_source = ""
+        chirp_mass = total_mass = mass_ratio = chi_eff = distance = None
         if has_chirp:
             params = self.waveform_generator.sample_intrinsic(signal_type, rng=rng)
             waveform = self.waveform_generator.generate(signal_type, params)
+            waveform_source = str(waveform.params.get("waveform_source", ""))
+            chirp_mass, total_mass, mass_ratio, chi_eff = _chirp_derived(params)
+            distance = params.get("distance")
             # Constrain the inserted chirp to this source type's common band.
             band = cfg.signal_freq_bands.get(signal_type, (cfg.frange_low, cfg.frange_high))
             inject_waveform = _bandlimit(
@@ -200,10 +244,16 @@ class DatasetBuilder:
 
             boxes: List[TimeFrequencyBox] = []
             glitch_id = glitch_type = ""
+            glitch_start = glitch_end = glitch_cf = glitch_lf = glitch_hf = glitch_amp = ""
             if has_glitch:
                 glitch = self.noise_generator.sample_glitch(rng)
                 series = series + glitch.series
                 glitch_id, glitch_type = glitch.glitch_id, glitch.glitch_type
+                glitch_start, glitch_end = glitch.start_time, glitch.end_time
+                glitch_cf, glitch_lf, glitch_hf = (
+                    glitch.center_freq, glitch.low_freq, glitch.high_freq,
+                )
+                glitch_amp = glitch.amplitude
                 gbox = self.label_generator.glitch_box(
                     glitch.start_time, glitch.end_time, glitch.low_freq, glitch.high_freq
                 )
@@ -316,6 +366,14 @@ class DatasetBuilder:
             label_low = chirp_box.freq_low if chirp_box is not None else ""
             label_high = chirp_box.freq_high if chirp_box is not None else ""
 
+            # YOLO chirp box in normalized image coordinates.
+            yolo_cx = yolo_cy = yolo_w = yolo_h = ""
+            if chirp_box is not None:
+                parts = self.label_generator.to_yolo(chirp_box).split()
+                yolo_cx, yolo_cy, yolo_w, yolo_h = parts[1], parts[2], parts[3], parts[4]
+            num_boxes = len(boxes)
+            has_label = int(num_boxes > 0)
+
             row = {
                 "sample_id": sample_id,
                 "event_id": event_id,
@@ -365,6 +423,34 @@ class DatasetBuilder:
                 "noise_type": noise_type,
                 "glitch_id": glitch_id,
                 "glitch_type": glitch_type,
+                "waveform_source": waveform_source if has_chirp else "",
+                "waveform_approximant": params.get("approximant", "") if has_chirp else "",
+                "mass1": _fmt(params.get("mass1")) if has_chirp else "",
+                "mass2": _fmt(params.get("mass2")) if has_chirp else "",
+                "spin1z": _fmt(params.get("spin1z")) if has_chirp else "",
+                "spin2z": _fmt(params.get("spin2z")) if has_chirp else "",
+                "chirp_mass": _fmt(chirp_mass) if has_chirp else "",
+                "total_mass": _fmt(total_mass) if has_chirp else "",
+                "mass_ratio": _fmt(mass_ratio) if has_chirp else "",
+                "chi_eff": _fmt(chi_eff) if has_chirp else "",
+                "distance": _fmt(distance) if has_chirp else "",
+                "f_lower": _fmt(params.get("f_lower")) if has_chirp else "",
+                "geocent_injection_time": _fmt(injection_time_value) if has_chirp else "",
+                "chirp_yolo_cx": yolo_cx,
+                "chirp_yolo_cy": yolo_cy,
+                "chirp_yolo_w": yolo_w,
+                "chirp_yolo_h": yolo_h,
+                "has_label": has_label,
+                "num_boxes": num_boxes,
+                "glitch_start_time": _fmt(glitch_start) if has_glitch else "",
+                "glitch_end_time": _fmt(glitch_end) if has_glitch else "",
+                "glitch_center_freq": _fmt(glitch_cf) if has_glitch else "",
+                "glitch_low_freq": _fmt(glitch_lf) if has_glitch else "",
+                "glitch_high_freq": _fmt(glitch_hf) if has_glitch else "",
+                "glitch_amplitude": _fmt(glitch_amp) if has_glitch else "",
+                "sample_rate": cfg.sample_rate,
+                "duration": _fmt(cfg.duration),
+                "n_samples": cfg.n_samples,
             }
             rows.append(row)
             self._sample_info.append(
@@ -384,38 +470,45 @@ class DatasetBuilder:
                 }
             )
 
-        # ---- cross-detector fields
+        # ---- cross-detector fields, then stream rows to disk
         network_snr = math.sqrt(sum(s * s for s in detector_snrs)) if detector_snrs else ""
         for row in rows:
             others = [r["sample_id"] for r in rows if r["sample_id"] != row["sample_id"]]
             row["counterpart_sample_ids"] = ";".join(others)
             row["network_snr"] = _fmt(network_snr) if network_snr != "" else ""
             self._meta_rows.append(row)
+            meta_writer.writerow({k: row.get(k, "") for k in METADATA_FIELDS})
 
-        self._event_rows.append(
-            {
-                "event_id": event_id,
-                "chirp_id": chirp_id,
-                "split": split,
-                "signal_type": signal_type,
-                "has_chirp": int(has_chirp),
-                "waveform_approximant": params.get("approximant", "") if has_chirp else "",
-                "mass1": _fmt(params.get("mass1")) if has_chirp else "",
-                "mass2": _fmt(params.get("mass2")) if has_chirp else "",
-                "spin1z": _fmt(params.get("spin1z")) if has_chirp else "",
-                "spin2z": _fmt(params.get("spin2z")) if has_chirp else "",
-                "f_lower": _fmt(params.get("f_lower")) if has_chirp else "",
-                "sample_rate": cfg.sample_rate,
-                "duration": _fmt(cfg.duration),
-                "injection_time": _fmt(injection_time_value) if has_chirp else "",
-                "network_snr": _fmt(network_snr) if network_snr != "" else "",
-                "detectors": ";".join(cfg.detectors),
-                "num_detector_samples": len(rows),
-                "qtransform_frange_low": _fmt(cfg.frange_low),
-                "qtransform_frange_high": _fmt(cfg.frange_high),
-                "frequency_axis_scale": cfg.frequency_axis_scale,
-            }
-        )
+        event_row = {
+            "event_id": event_id,
+            "chirp_id": chirp_id,
+            "split": split,
+            "signal_type": signal_type,
+            "has_chirp": int(has_chirp),
+            "waveform_approximant": params.get("approximant", "") if has_chirp else "",
+            "mass1": _fmt(params.get("mass1")) if has_chirp else "",
+            "mass2": _fmt(params.get("mass2")) if has_chirp else "",
+            "spin1z": _fmt(params.get("spin1z")) if has_chirp else "",
+            "spin2z": _fmt(params.get("spin2z")) if has_chirp else "",
+            "f_lower": _fmt(params.get("f_lower")) if has_chirp else "",
+            "sample_rate": cfg.sample_rate,
+            "duration": _fmt(cfg.duration),
+            "injection_time": _fmt(injection_time_value) if has_chirp else "",
+            "network_snr": _fmt(network_snr) if network_snr != "" else "",
+            "detectors": ";".join(cfg.detectors),
+            "num_detector_samples": len(rows),
+            "qtransform_frange_low": _fmt(cfg.frange_low),
+            "qtransform_frange_high": _fmt(cfg.frange_high),
+            "frequency_axis_scale": cfg.frequency_axis_scale,
+            "distance": _fmt(distance) if has_chirp else "",
+            "chirp_mass": _fmt(chirp_mass) if has_chirp else "",
+            "total_mass": _fmt(total_mass) if has_chirp else "",
+            "mass_ratio": _fmt(mass_ratio) if has_chirp else "",
+            "chi_eff": _fmt(chi_eff) if has_chirp else "",
+            "waveform_source": waveform_source if has_chirp else "",
+            "n_samples": cfg.n_samples,
+        }
+        event_writer.writerow({k: event_row.get(k, "") for k in EVENT_FIELDS})
 
     # --------------------------------------------------------------- helpers
     def _prepare_directories(self) -> None:
@@ -424,6 +517,14 @@ class DatasetBuilder:
             for split in ("train", "val", "test"):
                 for det in self.config.detectors:
                     (self.root / sub / split / det).mkdir(parents=True, exist_ok=True)
+
+    def _write_dataset_config(self) -> None:
+        """Dump the full DatasetConfig for reproducibility/provenance."""
+        data = asdict(self.config)
+        data["output_dir"] = str(self.config.output_dir)
+        (self.root / "dataset_config.json").write_text(
+            json.dumps(data, indent=2, default=str), encoding="utf-8"
+        )
 
     def _write_csv(self, name: str, fields, rows) -> None:
         path = self.root / name

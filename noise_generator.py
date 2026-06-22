@@ -50,6 +50,7 @@ class GlitchRealization:
     center_freq: float
     low_freq: float
     high_freq: float
+    amplitude: float
 
 
 class NoiseGenerator:
@@ -124,4 +125,5 @@ class NoiseGenerator:
             center_freq=center_freq,
             low_freq=low_freq,
             high_freq=high_freq,
+            amplitude=amp,
         )

@@ -125,6 +125,38 @@ METADATA_FIELDS = (
     "noise_type",
     "glitch_id",
     "glitch_type",
+    # --- physical parameters (denormalized per sample for single-table ML use)
+    "waveform_source",
+    "waveform_approximant",
+    "mass1",
+    "mass2",
+    "spin1z",
+    "spin2z",
+    "chirp_mass",
+    "total_mass",
+    "mass_ratio",
+    "chi_eff",
+    "distance",
+    "f_lower",
+    "geocent_injection_time",
+    # --- YOLO chirp box in normalized image coordinates
+    "chirp_yolo_cx",
+    "chirp_yolo_cy",
+    "chirp_yolo_w",
+    "chirp_yolo_h",
+    "has_label",
+    "num_boxes",
+    # --- glitch time-frequency detail
+    "glitch_start_time",
+    "glitch_end_time",
+    "glitch_center_freq",
+    "glitch_low_freq",
+    "glitch_high_freq",
+    "glitch_amplitude",
+    # --- acquisition (so a .npy can be loaded without joining other tables)
+    "sample_rate",
+    "duration",
+    "n_samples",
 )
 
 # One row per astrophysical event.
@@ -149,6 +181,13 @@ EVENT_FIELDS = (
     "qtransform_frange_low",
     "qtransform_frange_high",
     "frequency_axis_scale",
+    "distance",
+    "chirp_mass",
+    "total_mass",
+    "mass_ratio",
+    "chi_eff",
+    "waveform_source",
+    "n_samples",
 )
 
 # One row per positive (same-chirp cross-detector) pair.

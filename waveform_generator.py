@@ -152,7 +152,9 @@ class WaveformGenerator:
         if hp_arr.size > max_len:
             hp_arr = hp_arr[-max_len:]
             hc_arr = hc_arr[-max_len:]
-        return Waveform(hp_arr, hc_arr, self.config.sample_rate, dict(params))
+        out_params = dict(params)
+        out_params["waveform_source"] = "pycbc"
+        return Waveform(hp_arr, hc_arr, self.config.sample_rate, out_params)
 
     def _generate_analytic(self, params: Dict[str, object]) -> Waveform:
         """Leading-order analytic inspiral chirp.
