@@ -1,14 +1,38 @@
-# GW-YOLO-style two-detector synthetic dataset generator
+# gw_generator — two-detector synthetic gravitational-wave dataset
 
-Generates a **dual-detector (H1 + L1), event-level** synthetic gravitational-wave
-dataset for four benchmark tasks:
+A **dual-detector (H1 + L1), event-level** synthetic gravitational-wave dataset
+generator for GW-YOLO-style machine-learning benchmarks. Each astrophysical
+*event* shares one physical chirp across detectors, while every detector-level
+*sample* gets its own noise realization, detector effects, strain files,
+Q-transform images, YOLO labels, and pairing metadata.
 
-1. Single-detector chirp/glitch detection (YOLO)
-2. Cross-detector same-chirp matching (Siamese / pair classification)
-3. Coherent event-level detection
-4. Low-SNR robustness & glitch rejection
+> This is a *GW-YOLO-style* approximation for research/education, **not** an
+> official reproduction of any published GW-YOLO dataset.
 
-It is a *GW-YOLO-style* approximation, not an official reproduction.
+## Benchmark tasks
+
+| # | Task | Model type | Labels |
+|---|------|------------|--------|
+| 1 | Single-detector chirp/glitch detection | YOLO object detection | `labels_yolo/` |
+| 2 | Cross-detector same-chirp matching | Siamese / pair classifier | `match_pairs.csv`, `negative_pairs.csv`, `pair_metadata.csv` |
+| 3 | Coherent event-level detection | Event-level fusion | `event_metadata.csv` |
+| 4 | Low-SNR robustness & glitch rejection | Any of the above, stratified | `metadata.csv` (SNR bins, glitch flags) |
+
+## Features
+
+- **Shared chirp, independent detectors** — one waveform + intrinsic parameters
+  per event; per-detector noise, optional glitch, arrival-time delay (±10 ms),
+  amplitude scaling, optional sign flip, and per-detector SNR.
+- **Physical waveforms** via PyCBC (BBH/BNS), with an analytic inspiral-chirp
+  fallback (frequency sweep set by chirp mass + `f_lower`) so the pipeline runs
+  with no scientific stack.
+- **LIGO Q-transform** via GWpy (the Omega Q-scan) by default, with a built-in
+  constant-Q (Gaussian filterbank) fallback that needs only numpy/scipy.
+- **aLIGO-colored noise** (seismic wall, ~215 Hz bucket, shot-noise rise) so the
+  *raw* Q-transform looks detector-like and the *whitened* one is flat.
+- **Leakage-safe** event-level train/val/test split with post-build validators.
+- **Rich metadata** — detector-sample, event, positive/negative/combined pair
+  tables, plus a full `dataset_config.json` for reproducibility.
 
 ## Install
 
@@ -16,75 +40,115 @@ It is a *GW-YOLO-style* approximation, not an official reproduction.
 pip install -r requirements.txt
 ```
 
-Core deps (numpy, scipy, matplotlib, pillow) are enough to run everything.
-PyCBC / GWpy are optional: when present they provide physical waveforms and a
-true Q-transform; when absent the builder uses an analytic inspiral chirp
-(frequency sweep determined by masses + `f_lower`) and a scipy spectrogram.
+Core deps (`numpy`, `scipy`, `matplotlib`, `pillow`) run everything. `pycbc` and
+`gwpy` are optional but recommended for physical waveforms and the real LIGO
+Q-transform; install them in a conda env (e.g. `conda activate gw-yolo`).
 
-## Frequency coordinate system (fixed)
-
-The Q-transform window, the display axis, and the YOLO y-normalization all use a
-**hardcoded linear 0-1000 Hz** coordinate system. It is intentionally not
-configurable — `--frange-low/--frange-high/--frequency-axis-scale` are accepted
-for backward compatibility but **ignored**.
-
-Chirp *insertion* is constrained to each source type's web-verified common
-LIGO-band range, so a signal's visible energy lands where that type radiates:
-
-| Type | Insertion band | Basis |
-|---|---|---|
-| BBH  | 20-350 Hz  | GW150914 swept 35->250 Hz, FLSO ~220 Hz |
-| BNS  | 20-1000 Hz | inspiral sweeps from ~10 Hz to ~1 kHz coalescence |
-| NSBH | 20-400 Hz  | typical FLSO ~400 Hz |
-
-## Run
+## Quickstart
 
 ```bash
+# Default: GWpy Q-transform + PyCBC waveforms
 python build_dataset.py --num-events 5 --detectors H1 L1 --duration 4.0 \
-  --output-dir out_smoke --qtransform-backend scipy --seed 42
+  --output-dir out_smoke --seed 42
 
+# No scientific stack required (built-in constant-Q + analytic chirp)
 python build_dataset.py --num-events 5 --detectors H1 L1 --duration 4.0 \
-  --output-dir out_smoke_2 --qtransform-backend scipy --seed 43
+  --output-dir out_smoke --qtransform-backend scipy --no-pycbc --seed 42
 ```
 
-Add `--no-pycbc` to force the analytic fallback even if PyCBC is installed.
-(The original `--frange-high 512 / 2048` commands still run, but the window
-stays fixed at 0-1000 Hz and a notice is printed.)
-
-## Tests
+Run the tests (no PyCBC/GWpy needed — they use the offline fallbacks):
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## Output layout (flat, event-level 3-way split)
+### Scaling up
+
+Each detector-level sample writes 1 normalized-train image (the YOLO input);
+each event has H1+L1. So **N events ⇒ 2N training images**. For ~1000 YOLO
+training images use `--num-events 500`. Full outputs (raw + display) add 3 more
+PNGs per sample. Speed tips: `--no-raw-outputs` / `--no-display-images` to write
+less, `--no-pycbc` to skip long BNS inspiral generation, or
+`--qtransform-backend scipy` for a faster transform. `metadata.csv` is streamed
+per event, so progress is visible (`wc -l <out>/metadata.csv`) and interrupted
+runs still leave a coherent dataset.
+
+## Frequency coordinate system (fixed)
+
+The Q-transform window, display axis, and YOLO y-normalization all use a
+**hardcoded linear 0–1000 Hz** system (`coords.py`), so images and labels always
+share one coordinate frame. `--frange-*` / `--frequency-axis-scale` are accepted
+but ignored. Chirp *insertion* is band-limited to each source type's
+web-verified LIGO-band range:
+
+| Type | Insertion band | Basis |
+|------|----------------|-------|
+| BBH  | 20–350 Hz  | GW150914 swept 35→250 Hz, FLSO ~220 Hz |
+| BNS  | 20–1000 Hz | inspiral sweeps from ~10 Hz to ~1 kHz coalescence |
+| NSBH | 20–400 Hz  | typical FLSO ~400 Hz |
+
+## Output layout
 
 ```
 <output-dir>/
-  metadata.csv  event_metadata.csv
-  match_pairs.csv  negative_pairs.csv  pair_metadata.csv
-  task_protocols.yaml  gw_data.yaml
+  metadata.csv            one row per detector-level sample (rich schema)
+  event_metadata.csv      one row per astrophysical event
+  match_pairs.csv         positive (same-chirp, cross-detector) pairs
+  negative_pairs.csv      negatives (7 types incl. hard negatives)
+  pair_metadata.csv       combined positive + negative table (pair_label 0/1)
+  task_protocols.yaml     the four benchmark task definitions + rules
+  gw_data.yaml            YOLO data config (points at qtransform_normalized)
+  dataset_config.json     full DatasetConfig dump (provenance)
   raw_series/{train,val,test}/{H1,L1}/{sample_id}.npy
-  normalized_series/{train,val,test}/{H1,L1}/{sample_id}.npy
-  qtransform_raw/...                  (pure spectrogram, train image)
-  qtransform_normalized/...           (default YOLO input)
-  qtransform_display_raw/...          (axes + colorbar)
-  qtransform_display_normalized/...
+  normalized_series/{...}/{sample_id}.npy
+  qtransform_raw/{...}/{sample_id}.png               pure spectrogram (analysis)
+  qtransform_normalized/{...}/{sample_id}.png        default YOLO input
+  qtransform_display_raw/{...}/{sample_id}.png       axes + 0–25 colorbar
+  qtransform_display_normalized/{...}/{sample_id}.png
   labels_yolo/{train,val,test}/{H1,L1}/{sample_id}.txt
 ```
 
-## Key design points
+## Metadata schema (highlights)
 
-- **Shared chirp, independent detectors.** One event = one waveform + intrinsic
-  params, shared by H1/L1. Each detector gets its own noise realization
-  (`noise_id`), optional glitch, arrival-time delay (±10 ms), amplitude scale,
-  optional sign flip, and its own SNR.
-- **Frequency coordinate system.** A fixed linear 0-1000 Hz window defines the
-  Q-transform image *and* the YOLO y-axis via the single mapping in `coords.py`,
-  so image and labels always share one coordinate system. Chirp insertion is
-  band-limited to each source type's realistic LIGO-band range.
-- **Labels** come from the clean waveform's instantaneous frequency (Hilbert),
-  with a Q-transform energy-ridge fallback, clipped to the configured window.
-- **Leakage-safe.** Splitting is at the event level first; chirps and pairs
-  never cross train/val/test. Validators run before success is reported.
-```
+`metadata.csv` (one row per sample) records IDs and relationships
+(`sample_id`/`event_id`/`chirp_id`/`counterpart_sample_ids`), class & SNR
+(`global_class`/`snr_bin`/`detector_snr`/`network_snr`), detector effects
+(`detector_time_delay`/`amplitude_scale`/`phase_or_sign_flip`), the frequency
+coordinate provenance, all file paths, energy stats, noise/glitch IDs, and —
+denormalized for single-table ML use — physical parameters (`mass1/2`,
+`spin1z/2z`, `chirp_mass`, `total_mass`, `mass_ratio`, `chi_eff`, `distance`,
+`f_lower`, `waveform_approximant`, `waveform_source`), the YOLO chirp box
+(`chirp_yolo_cx/cy/w/h`, `has_label`, `num_boxes`), glitch time-frequency detail,
+and acquisition fields (`sample_rate`, `duration`, `n_samples`).
+
+## Module map
+
+| File | Responsibility |
+|------|----------------|
+| `config.py` | `DatasetConfig` + all CSV schemas (single source of truth) |
+| `waveform_generator.py` | PyCBC BBH/BNS + analytic-chirp fallback |
+| `noise_generator.py` | aLIGO-colored Gaussian noise + synthetic glitches |
+| `injection.py` | target-SNR injection, merger-anchored, detector effects |
+| `preprocessing.py` | bandpass → whiten (off-source PSD) → normalize |
+| `coords.py` | the shared frequency ↔ image-coordinate mapping |
+| `qtransform.py` | GWpy / constant-Q transforms, energy norm, train+display images |
+| `label_generator.py` | instantaneous-frequency labels + Q-ridge fallback |
+| `pairs.py` | positive/negative/combined pair generation |
+| `validation.py` | leakage & pair-consistency validators |
+| `protocols.py` | `task_protocols.yaml` + `gw_data.yaml` writers |
+| `build_dataset.py` | `DatasetBuilder` + CLI |
+
+## Notes & limitations
+
+- The analytic waveform is a leading-order (Newtonian/quadrupole) inspiral; use
+  PyCBC for production fidelity.
+- The constant-Q `scipy` backend approximates a Q-transform; GWpy is the real
+  Omega Q-scan.
+- Per-detector delay/amplitude are sampled, not derived from sky position +
+  antenna response (so no `ra/dec/inclination` fields are stored).
+
+## Acknowledgements
+
+Builds on the open LIGO/Virgo software ecosystem — [GWpy](https://gwpy.github.io/),
+[PyCBC](https://pycbc.org/) — and is inspired by the GW-YOLO approach to
+treating gravitational-wave detection as time-frequency object detection.
