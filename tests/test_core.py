@@ -161,14 +161,14 @@ class SharedDatasetTests(unittest.TestCase):
         for r in self.meta:
             self.assertEqual(float(r["energy_vmax"]), 25.0)
 
-    # 14 — metadata / label / image frequency ranges are the fixed 0-1000 window
-    def test_14_frequency_window_fixed_0_1000(self):
+    # 14 — metadata / label / image frequency ranges are the fixed log 20-1000 window
+    def test_14_frequency_window_fixed_20_1000_log(self):
         for r in self.meta:
-            self.assertEqual(float(r["qtransform_frange_low"]), 0.0)
+            self.assertEqual(float(r["qtransform_frange_low"]), 20.0)
             self.assertEqual(float(r["qtransform_frange_high"]), 1000.0)
-            self.assertEqual(r["frequency_axis_scale"], "linear")
+            self.assertEqual(r["frequency_axis_scale"], "log")
             if r["label_frange_low"]:
-                self.assertGreaterEqual(float(r["label_frange_low"]), 0.0 - 1e-6)
+                self.assertGreaterEqual(float(r["label_frange_low"]), 20.0 - 1e-6)
                 self.assertLessEqual(float(r["label_frange_high"]), 1000.0 + 1e-6)
 
     # per-type insertion band: chirp energy stays in the source type's band
@@ -253,7 +253,7 @@ class SharedDatasetTests(unittest.TestCase):
         text = (self.root / "task_protocols.yaml").read_text(encoding="utf-8")
         self.assertIn("frequency_coordinate_rule", text)
         self.assertIn("frange_high: 1000", text)
-        self.assertIn("frequency_axis_scale: linear", text)
+        self.assertIn("frequency_axis_scale: log", text)
         self.assertIn("label_normalization_source: same_as_qtransform", text)
         self.assertIn("per_type_insertion_bands", text)
 
@@ -322,11 +322,11 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             DatasetConfig(sample_rate=1024)
 
-    def test_window_is_hardcoded_0_1000_linear(self):
+    def test_window_is_hardcoded_20_1000_log(self):
         cfg = DatasetConfig(num_events=1)
-        self.assertEqual(cfg.frange_low, 0.0)
+        self.assertEqual(cfg.frange_low, 20.0)
         self.assertEqual(cfg.frange_high, 1000.0)
-        self.assertEqual(cfg.frequency_axis_scale, "linear")
+        self.assertEqual(cfg.frequency_axis_scale, "log")
 
 
 if __name__ == "__main__":

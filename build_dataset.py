@@ -39,6 +39,7 @@ from config import (
 from injection import inject_chirp
 from label_generator import LabelGenerator, TimeFrequencyBox
 from noise_generator import NoiseGenerator
+from real_glitch import GlitchDependencyError, GlitchFetchError, RealGlitchProvider
 from pairs import PairBuilder
 from preprocessing import Preprocessor
 from protocols import write_gw_data_yaml, write_task_protocols
@@ -109,6 +110,9 @@ class DatasetBuilder:
         self.config = config
         self.rng = np.random.default_rng(config.seed)
         self.noise_generator = NoiseGenerator(config)
+        self.real_glitch_provider = (
+            RealGlitchProvider(config) if config.glitch_source == "gwosc" else None
+        )
         self.waveform_generator = WaveformGenerator(config, use_pycbc=use_pycbc)
         self.preprocessor = Preprocessor(config)
         self.qtransform_renderer = QTransformRenderer(config)
@@ -177,6 +181,66 @@ class DatasetBuilder:
         self._write_csv("pair_metadata.csv", PAIR_FIELDS, pair_rows)
         write_task_protocols(self.config, self.root)
         write_gw_data_yaml(self.config, self.root)
+        self._write_glitch_catalog_used()
+
+    def _write_glitch_catalog_used(self) -> None:
+        """One row per injected glitch (details of every glitch actually used)."""
+        fields = [
+            "sample_id", "split", "detector", "glitch_source", "glitch_id",
+            "glitch_type", "glitch_gps", "glitch_snr_catalog", "glitch_amplitude",
+            "glitch_start_time", "glitch_end_time", "glitch_low_freq", "glitch_high_freq",
+        ]
+        rows = [
+            {k: r.get(k, "") for k in fields}
+            for r in self._meta_rows
+            if str(r.get("has_glitch", "")) in ("1", "True", "true")
+        ]
+        self._write_csv("glitch_catalog_used.csv", fields, rows)
+
+    # --------------------------------------------------------- real glitch
+    def _acquire_real_glitch(self, rng, detector: str):
+        """Sample a real glitch segment that shows a localized energy ridge.
+
+        The box is measured on the glitch-only render (the real segment, no
+        chirp), so a chirp sharing the sample can never leak into the glitch
+        label. Returns ``(glitch, trial_box, used_synthetic_fallback)``. Retries
+        up to ``cfg.max_glitch_attempts`` when the fetch fails, no ridge is
+        found, or the box covers more than ``cfg.glitch_max_box_frac`` of the
+        image; on exhaustion (or a gwpy error) falls back to a synthetic glitch
+        if ``glitch_allow_synthetic_fallback`` is set, otherwise raises
+        :class:`GlitchFetchError`.
+        """
+        cfg = self.config
+        last_exc: Optional[Exception] = None
+        for _ in range(max(1, cfg.max_glitch_attempts)):
+            try:
+                glitch = self.real_glitch_provider.sample_glitch(rng, detector)
+            except GlitchDependencyError as exc:
+                last_exc = exc
+                break  # environment error (e.g. gwpy missing) won't fix on retry
+            except GlitchFetchError as exc:
+                # Unavailable GPS or transient fetch trouble; try another glitch.
+                last_exc = exc
+                continue
+            trial = self.preprocessor.preprocess(glitch.series)
+            stats = self.qtransform_renderer.energy_stats(trial)
+            box = self.label_generator.glitch_box_from_ridge(
+                stats.energy, stats.freqs, stats.times,
+                (glitch.start_time, glitch.end_time), cfg.label_ridge_threshold,
+            )
+            if box is not None and (
+                self.label_generator.box_area_fraction(box) <= cfg.glitch_max_box_frac
+            ):
+                return glitch, box, False
+        if cfg.glitch_allow_synthetic_fallback:
+            return self.noise_generator.sample_glitch(rng), None, True
+        msg = (
+            f"could not obtain a real glitch with a detectable ridge for {detector} "
+            f"after {cfg.max_glitch_attempts} attempts"
+        )
+        if last_exc is not None:
+            raise GlitchFetchError(f"{msg}: {last_exc}") from last_exc
+        raise GlitchFetchError(msg)
 
     # ----------------------------------------------------------- event split
     def _event_split_assignment(self) -> List[str]:
@@ -239,26 +303,57 @@ class DatasetBuilder:
             sample_id = f"{split}_{index:06d}_{detector}"
             bg = self.noise_generator.background_noise(rng)
             series = bg.series.copy()
-            noise_reference = bg.series.copy()  # signal-free ASD estimate
             noise_id, noise_type = bg.noise_id, bg.noise_type
 
             boxes: List[TimeFrequencyBox] = []
             glitch_id = glitch_type = ""
             glitch_start = glitch_end = glitch_cf = glitch_lf = glitch_hf = glitch_amp = ""
+            glitch_source = glitch_gps = glitch_snr_cat = ""
             if has_glitch:
-                glitch = self.noise_generator.sample_glitch(rng)
-                series = series + glitch.series
+                glitch_trial_box = None
+                if self.real_glitch_provider is not None:
+                    glitch, glitch_trial_box, _used_synth = self._acquire_real_glitch(
+                        rng, detector
+                    )
+                else:
+                    glitch = self.noise_generator.sample_glitch(rng)
+                if glitch_trial_box is not None:
+                    # Real segment: glitch in its own real noise REPLACES the
+                    # synthetic background (adding it would stack two noise
+                    # floors into a broadband pedestal across the window).
+                    series = glitch.series.copy()
+                    noise_id, noise_type = glitch.glitch_id, "real_gwosc"
+                else:
+                    series = series + glitch.series
                 glitch_id, glitch_type = glitch.glitch_id, glitch.glitch_type
                 glitch_start, glitch_end = glitch.start_time, glitch.end_time
                 glitch_cf, glitch_lf, glitch_hf = (
                     glitch.center_freq, glitch.low_freq, glitch.high_freq,
                 )
                 glitch_amp = glitch.amplitude
-                gbox = self.label_generator.glitch_box(
-                    glitch.start_time, glitch.end_time, glitch.low_freq, glitch.high_freq
-                )
-                if gbox is not None:
-                    boxes.append(gbox)
+                glitch_source = getattr(glitch, "source", "synthetic")
+                glitch_gps = getattr(glitch, "gps", "")
+                glitch_snr_cat = getattr(glitch, "snr_catalog", "")
+                if glitch_trial_box is not None:
+                    # Real glitch: the box measured on the glitch-only render is
+                    # authoritative (a box from the final combined render could
+                    # absorb a chirp crossing the glitch window).
+                    boxes.append(glitch_trial_box)
+                    glitch_start, glitch_end = (
+                        glitch_trial_box.time_start, glitch_trial_box.time_end,
+                    )
+                    glitch_lf, glitch_hf = (
+                        glitch_trial_box.freq_low, glitch_trial_box.freq_high,
+                    )
+                    # Geometric mean = the box center on the log-frequency axis.
+                    glitch_cf = float(np.sqrt(glitch_lf * glitch_hf))
+                else:
+                    # Synthetic (or synthetic fallback): analytic box.
+                    gbox = self.label_generator.glitch_box(
+                        glitch.start_time, glitch.end_time, glitch.low_freq, glitch.high_freq
+                    )
+                    if gbox is not None:
+                        boxes.append(gbox)
 
             # ---- per-detector chirp injection
             chirp_box = None
@@ -284,6 +379,10 @@ class DatasetBuilder:
                     time_delay=td,
                     amp_scale=amp,
                     sign_flip=sign_flip,
+                    # SNR scaling must see the glitch-free noise: a loud glitch
+                    # in ``series`` inflates the std and the chirp comes out
+                    # louder than the requested target SNR.
+                    noise_reference=bg.series,
                 )
                 raw = injected.combined
                 target_snr = det_target
@@ -323,7 +422,7 @@ class DatasetBuilder:
                 np.save(raw_npy, raw.astype(np.float32))
                 raw_rel = _rel(raw_npy, self.root)
 
-            normalized = self.preprocessor.preprocess(raw, noise_reference=noise_reference)
+            normalized = self.preprocessor.preprocess(raw)
             norm_npy.parent.mkdir(parents=True, exist_ok=True)
             np.save(norm_npy, normalized.astype(np.float32))
 
@@ -448,6 +547,11 @@ class DatasetBuilder:
                 "glitch_low_freq": _fmt(glitch_lf) if has_glitch else "",
                 "glitch_high_freq": _fmt(glitch_hf) if has_glitch else "",
                 "glitch_amplitude": _fmt(glitch_amp) if has_glitch else "",
+                "glitch_source": glitch_source if has_glitch else "",
+                "glitch_gps": _fmt(glitch_gps) if (has_glitch and glitch_gps != "") else "",
+                "glitch_snr_catalog": (
+                    _fmt(glitch_snr_cat) if (has_glitch and glitch_snr_cat != "") else ""
+                ),
                 "sample_rate": cfg.sample_rate,
                 "duration": _fmt(cfg.duration),
                 "n_samples": cfg.n_samples,
@@ -542,14 +646,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--detectors", nargs="+", default=["H1", "L1"])
     p.add_argument("--duration", type=float, default=4.0)
     p.add_argument("--sample-rate", type=int, default=4096)
-    # The frequency window is hardcoded to a fixed linear 0-1000 Hz coordinate
+    # The frequency window is hardcoded to a fixed log 20-1000 Hz coordinate
     # system. These flags are accepted for backward compatibility but IGNORED.
     p.add_argument("--frange-low", type=float, default=None,
-                   help="(ignored) frequency window is fixed at 0-1000 Hz")
+                   help="(ignored) frequency window is fixed at 20-1000 Hz")
     p.add_argument("--frange-high", type=float, default=None,
-                   help="(ignored) frequency window is fixed at 0-1000 Hz")
+                   help="(ignored) frequency window is fixed at 20-1000 Hz")
     p.add_argument("--frequency-axis-scale", choices=["log", "linear"], default=None,
-                   help="(ignored) frequency axis is fixed to linear")
+                   help="(ignored) frequency axis is fixed to log")
     p.add_argument("--output-dir", default="gw_synthetic_dataset")
     p.add_argument("--qtransform-backend", choices=["gwpy", "scipy"], default="gwpy",
                    help="gwpy = LIGO Omega Q-scan (default); scipy = built-in constant-Q")
@@ -580,6 +684,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-display-images", dest="save_display_images", action="store_false", default=True)
     p.add_argument("--no-pycbc", dest="use_pycbc", action="store_false", default=True,
                    help="Force the analytic waveform fallback (skip PyCBC).")
+    # --- real (GWOSC) glitch injection
+    p.add_argument("--glitch-source", choices=["synthetic", "gwosc"], default="synthetic",
+                   help="synthetic sine-Gaussian (default) or real GWOSC glitches.")
+    p.add_argument("--glitch-metadata-csv", default=None,
+                   help="Gravity Spy pool CSV (gps,ifo,label,...); required for gwosc.")
+    p.add_argument("--real-glitch-cache-dir", default=None,
+                   help="Cache dir for fetched strain (default: <output-dir>/glitch_cache).")
+    p.add_argument("--glitch-fetch-halfwin", type=float, default=None,
+                   help="Seconds of strain fetched on each side of the glitch GPS.")
+    p.add_argument("--glitch-default-duration", type=float, default=None,
+                   help="Crop length (s) when a pool row lacks a duration.")
+    p.add_argument("--no-glitch-whiten", dest="glitch_whiten", action="store_false", default=True,
+                   help="Skip whitening the fetched real glitch.")
+    p.add_argument("--glitch-amp-min", type=float, default=None,
+                   help="Min amplitude scale for the unit-std glitch.")
+    p.add_argument("--glitch-amp-max", type=float, default=None,
+                   help="Max amplitude scale for the unit-std glitch.")
+    p.add_argument("--max-glitch-attempts", type=int, default=None,
+                   help="Resample a real glitch up to N times if no ridge is found.")
+    p.add_argument("--glitch-max-box-frac", type=float, default=None,
+                   help="Reject real-glitch boxes covering more than this image fraction.")
+    p.add_argument("--glitch-allow-synthetic-fallback", action="store_true", default=False,
+                   help="Fall back to synthetic when GWOSC/gwpy fails or no ridge is found.")
     return p.parse_args(argv)
 
 
@@ -607,11 +734,32 @@ def config_from_args(args: argparse.Namespace) -> DatasetConfig:
         allow_cross_split_negative_pairs=args.allow_cross_split_negative_pairs,
         save_raw_outputs=args.save_raw_outputs,
         save_display_images=args.save_display_images,
+        glitch_source=args.glitch_source,
+        glitch_whiten=args.glitch_whiten,
+        glitch_allow_synthetic_fallback=args.glitch_allow_synthetic_fallback,
     )
     if args.injection_time_min is not None:
         kwargs["injection_time_min"] = args.injection_time_min
     if args.injection_time_max is not None:
         kwargs["injection_time_max"] = args.injection_time_max
+    if args.glitch_metadata_csv is not None:
+        kwargs["glitch_metadata_csv"] = args.glitch_metadata_csv
+    if args.real_glitch_cache_dir is not None:
+        kwargs["real_glitch_cache_dir"] = args.real_glitch_cache_dir
+    if args.glitch_fetch_halfwin is not None:
+        kwargs["glitch_fetch_halfwin"] = args.glitch_fetch_halfwin
+    if args.glitch_default_duration is not None:
+        kwargs["glitch_default_duration"] = args.glitch_default_duration
+    if args.max_glitch_attempts is not None:
+        kwargs["max_glitch_attempts"] = args.max_glitch_attempts
+    if args.glitch_max_box_frac is not None:
+        kwargs["glitch_max_box_frac"] = args.glitch_max_box_frac
+    if args.glitch_amp_min is not None or args.glitch_amp_max is not None:
+        lo, hi = DatasetConfig().glitch_amplitude_range
+        kwargs["glitch_amplitude_range"] = (
+            args.glitch_amp_min if args.glitch_amp_min is not None else lo,
+            args.glitch_amp_max if args.glitch_amp_max is not None else hi,
+        )
     return DatasetConfig(**kwargs)
 
 
@@ -619,7 +767,7 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     if any(v is not None for v in (args.frange_low, args.frange_high, args.frequency_axis_scale)):
         print("[notice] --frange-low/--frange-high/--frequency-axis-scale are ignored; "
-              "the frequency window is fixed at linear 0-1000 Hz.")
+              "the frequency window is fixed at log 20-1000 Hz.")
     config = config_from_args(args)
     builder = DatasetBuilder(config, use_pycbc=args.use_pycbc)
     metadata_path = builder.build()

@@ -41,6 +41,7 @@ def inject_chirp(
     time_delay: float = 0.0,
     amp_scale: float = 1.0,
     sign_flip: bool = False,
+    noise_reference: np.ndarray | None = None,
 ) -> Injection:
     """Inject ``waveform`` into ``background`` scaled to ``target_snr``.
 
@@ -49,12 +50,16 @@ def inject_chirp(
     loud late-inspiral/merger inside the segment even for long inspirals.
     ``time_delay`` shifts the arrival time (s); ``amp_scale`` rescales the
     detector amplitude; ``sign_flip`` inverts the polarisation.
+    ``noise_reference`` is the glitch-free noise used to estimate the noise std
+    for SNR scaling; without it a loud glitch in ``background`` inflates the
+    estimate and the chirp is injected louder than ``target_snr``.
     """
     background = np.asarray(background, dtype=float)
     waveform = np.asarray(waveform, dtype=float)
     n = background.shape[0]
 
-    noise_sigma = float(np.std(background)) or 1.0
+    sigma_source = background if noise_reference is None else np.asarray(noise_reference, dtype=float)
+    noise_sigma = float(np.std(sigma_source)) or 1.0
 
     # Unit-SNR template, then scale to the requested target.
     base_snr = _whitened_norm_snr(waveform, noise_sigma)

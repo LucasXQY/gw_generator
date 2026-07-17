@@ -211,7 +211,7 @@ class QTransformRenderer:
     def _gwpy_energy(self, strain: np.ndarray) -> np.ndarray:
         """GWpy's tiled constant-Q transform (the LIGO/Virgo Omega Q-scan).
 
-        Returns gwpy's *normalized energy* mapped onto the fixed linear 0-1000 Hz
+        Returns gwpy's *normalized energy* mapped onto the fixed log 20-1000 Hz
         image grid. Raises a clear error if gwpy is unavailable.
         """
         cfg = self.config
@@ -226,7 +226,7 @@ class QTransformRenderer:
 
         ts = TimeSeries(strain, sample_rate=cfg.sample_rate)
         # gwpy uses log-spaced constant-Q tiles, so the low edge must be > 0.
-        # We map the result onto the fixed linear 0-1000 image grid afterwards.
+        # We map the result onto the fixed log 20-1000 image grid afterwards.
         gw_low = max(cfg.frange_low, 10.0)
         qgram = ts.q_transform(
             qrange=cfg.qrange,

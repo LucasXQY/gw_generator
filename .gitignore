@@ -15,9 +15,16 @@ env/
 out_*/
 gw_synthetic_dataset/
 gw_dataset*/
+datasets/
 pilot*/
 *.npy
 *.png
+
+# Glitch prefetch cache and QA render outputs
+glitch_cache/
+label_viz/output/
+.pytest_cache/
+*.log
 
 # Allow committing reference/sample images if ever placed under docs/
 !docs/**/*.png

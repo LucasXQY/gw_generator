@@ -52,12 +52,17 @@ SPLITS = ("train", "val", "test")
 # Hardcoded frequency coordinate system.
 #
 # The Q-transform window, the display axis, and the YOLO y-normalization all use
-# this single fixed, linear 0-1000 Hz window (the reference-image style). It is
-# intentionally NOT configurable: --frange-* CLI flags are accepted but ignored.
+# this single fixed log 20-1000 Hz window. A constant-Q transform is intrinsically
+# log-spaced in frequency (tile bandwidth scales with frequency), and gwpy's
+# q_transform returns log-spaced tiles, so a log axis matches both the transform's
+# native resolution and the GW-YOLO / LIGO Omega-scan display convention. The low
+# edge is 20 Hz (a log axis cannot include 0 Hz, and 20 Hz is the common CBC lower
+# cutoff). It is intentionally NOT configurable: --frange-* / --frequency-axis-scale
+# CLI flags are accepted but ignored.
 # --------------------------------------------------------------------------- #
-FIXED_FRANGE_LOW = 0.0
+FIXED_FRANGE_LOW = 20.0
 FIXED_FRANGE_HIGH = 1000.0
-FIXED_FREQUENCY_AXIS_SCALE = "linear"
+FIXED_FREQUENCY_AXIS_SCALE = "log"
 
 # Web-verified common GW frequency ranges per source type, in the LIGO/Virgo
 # band (~10-1000 Hz). Chirp insertion is constrained to the matching band so a
@@ -153,6 +158,9 @@ METADATA_FIELDS = (
     "glitch_low_freq",
     "glitch_high_freq",
     "glitch_amplitude",
+    "glitch_source",
+    "glitch_gps",
+    "glitch_snr_catalog",
     # --- acquisition (so a .npy can be loaded without joining other tables)
     "sample_rate",
     "duration",
@@ -341,6 +349,37 @@ class DatasetConfig:
     glitch_metadata_csv: Optional[Path | str] = None
     glitch_types: Tuple[str, ...] = field(default_factory=lambda: DEFAULT_GLITCH_TYPES)
 
+    # --- real (GWOSC) glitch injection ------------------------------------- #
+    # "synthetic" (default sine-Gaussian) or "gwosc" (real strain fetched by GPS
+    # from a Gravity Spy pool CSV supplied via glitch_metadata_csv).
+    glitch_source: str = "synthetic"
+    # Where fetched/resampled GWOSC strain segments are cached (raw, pre-whiten).
+    # Default: <output_dir>/glitch_cache (set in __post_init__).
+    real_glitch_cache_dir: Optional[Path | str] = None
+    # Seconds fetched on each side of the glitch GPS time (>= whiten fftlength need).
+    glitch_fetch_halfwin: float = 4.0
+    # Crop length used when a pool row lacks a `duration` (seconds).
+    glitch_default_duration: float = 0.5
+    glitch_whiten: bool = True
+    # Synthetic glitches only: the sine-Gaussian amplitude range. Real (gwosc)
+    # glitches keep their NATURAL amplitude -- the whitened segment is used as
+    # the whole sample with a unit robust noise floor, so rescaling the glitch
+    # independently of its own noise is neither possible nor desirable.
+    glitch_amplitude_range: Tuple[float, float] = (3.0, 8.0)
+    # Keep the injected glitch this far (s) from the segment edges.
+    glitch_placement_margin: float = 0.1
+    # Resample a new real glitch this many times if a fetch fails (GPS not in
+    # GWOSC open data) or no energy ridge is found. Unavailable GPS are cached
+    # and skipped, so later samples rarely need many tries.
+    max_glitch_attempts: int = 12
+    # If True, fall back to a synthetic glitch when GWOSC/gwpy is unavailable or
+    # no ridge is found after max_glitch_attempts; if False, raise (hard error).
+    glitch_allow_synthetic_fallback: bool = False
+    # Reject a real-glitch ridge box covering more than this fraction of the
+    # image (log-frequency aware) and resample: an oversized box means the
+    # injection lit up the background, not a localized glitch.
+    glitch_max_box_frac: float = 0.60
+
     # --------------------------------------------------------------- image / label output
     save_raw_outputs: bool = True
     save_display_images: bool = True
@@ -417,6 +456,17 @@ class DatasetConfig:
             self.glitch_metadata_csv = Path(self.glitch_metadata_csv)
         if isinstance(self.detectors, list):
             self.detectors = tuple(self.detectors)
+
+        # ---- real-glitch (GWOSC) settings
+        if self.glitch_source not in ("synthetic", "gwosc"):
+            raise ValueError(
+                f"glitch_source must be 'synthetic' or 'gwosc', got {self.glitch_source!r}"
+            )
+        if self.real_glitch_cache_dir is None:
+            self.real_glitch_cache_dir = self.output_dir / "glitch_cache"
+        else:
+            self.real_glitch_cache_dir = Path(self.real_glitch_cache_dir)
+        self.glitch_amplitude_range = tuple(self.glitch_amplitude_range)
 
         # ---- hardcode the frequency coordinate system (window is not configurable)
         self.frange_low = FIXED_FRANGE_LOW

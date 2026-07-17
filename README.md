@@ -28,8 +28,10 @@ Q-transform images, YOLO labels, and pairing metadata.
   with no scientific stack.
 - **LIGO Q-transform** via GWpy (the Omega Q-scan) by default, with a built-in
   constant-Q (Gaussian filterbank) fallback that needs only numpy/scipy.
-- **aLIGO-colored noise** (seismic wall, ~215 Hz bucket, shot-noise rise) so the
-  *raw* Q-transform looks detector-like and the *whitened* one is flat.
+- **aLIGO-colored noise** (seismic wall, ~215 Hz bucket, shot-noise rise) coloring
+  the strain; GWpy's `q_transform` returns *normalized energy* (per-frequency
+  median normalization), so the Q-transform images are flattened by GWpy itself
+  rather than by a separate strain-whitening step.
 - **Leakage-safe** event-level train/val/test split with post-build validators.
 - **Rich metadata** — detector-sample, event, positive/negative/combined pair
   tables, plus a full `dataset_config.json` for reproducibility.
@@ -76,10 +78,13 @@ runs still leave a coherent dataset.
 ## Frequency coordinate system (fixed)
 
 The Q-transform window, display axis, and YOLO y-normalization all use a
-**hardcoded linear 0–1000 Hz** system (`coords.py`), so images and labels always
-share one coordinate frame. `--frange-*` / `--frequency-axis-scale` are accepted
-but ignored. Chirp *insertion* is band-limited to each source type's
-web-verified LIGO-band range:
+**hardcoded log 20–1000 Hz** system (`coords.py`), so images and labels always
+share one coordinate frame. A constant-Q transform is log-spaced in frequency by
+construction (and GWpy returns log-spaced tiles), so a log axis matches both the
+transform's native resolution and the GW-YOLO / LIGO Omega-scan convention; 20 Hz
+is the low edge (a log axis excludes 0 Hz, and 20 Hz is the common CBC cutoff).
+`--frange-*` / `--frequency-axis-scale` are accepted but ignored. Chirp
+*insertion* is band-limited to each source type's web-verified LIGO-band range:
 
 | Type | Insertion band | Basis |
 |------|----------------|-------|
@@ -129,7 +134,7 @@ and acquisition fields (`sample_rate`, `duration`, `n_samples`).
 | `waveform_generator.py` | PyCBC BBH/BNS + analytic-chirp fallback |
 | `noise_generator.py` | aLIGO-colored Gaussian noise + synthetic glitches |
 | `injection.py` | target-SNR injection, merger-anchored, detector effects |
-| `preprocessing.py` | bandpass → whiten (off-source PSD) → normalize |
+| `preprocessing.py` | band-limit the strain to the Q-transform window (energy normalization is GWpy's job) |
 | `coords.py` | the shared frequency ↔ image-coordinate mapping |
 | `qtransform.py` | GWpy / constant-Q transforms, energy norm, train+display images |
 | `label_generator.py` | instantaneous-frequency labels + Q-ridge fallback |

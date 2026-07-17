@@ -150,6 +150,96 @@ class LabelGenerator:
         )
 
     # ----------------------------------------------------------------- glitch
+    def glitch_box_from_ridge(
+        self,
+        energy: np.ndarray,
+        freqs: np.ndarray,
+        times: np.ndarray,
+        time_window: Sequence[float],
+        ridge_threshold: float,
+        floor_gate: float = 5.0,
+        mass_quantile: float = 0.01,
+    ) -> Optional[TimeFrequencyBox]:
+        """Glitch box from the rendered Q-transform energy ridge, robust to
+        real-noise outliers.
+
+        The naive union of pixels above ``ridge_threshold * peak`` breaks on
+        real noise: normalized energy has an exponential tail, so for a weak
+        glitch the threshold drops into the tail and scattered noise pixels
+        stretch the box to the full band. Two defenses:
+
+        * a pixel is hot only if it also clears ``floor_gate`` times the
+          window's median energy (the noise floor);
+        * the box bounds are the [q, 1-q] quantiles of the hot pixels' energy
+          mass in time and frequency, not the min/max union, so an isolated
+          bright outlier carrying negligible mass cannot stretch the box.
+
+        Returns ``None`` if nothing clears both gates (caller resamples).
+        """
+        energy = np.asarray(energy, dtype=float)
+        freqs = np.asarray(freqs, dtype=float)
+        times = np.asarray(times, dtype=float)
+        if energy.size == 0:
+            return None
+
+        t_lo, t_hi = float(time_window[0]), float(time_window[1])
+        col_mask = (times >= t_lo) & (times <= t_hi)
+        if not np.any(col_mask):
+            col_mask = np.ones_like(times, dtype=bool)
+
+        sub = energy[:, col_mask]
+        peak = float(np.max(sub)) if sub.size else 0.0
+        if peak <= 0:
+            return None
+        floor = float(np.median(sub))
+        threshold = max(ridge_threshold * peak, floor_gate * floor)
+        hot = sub >= threshold
+        if not np.any(hot):
+            return None
+
+        mass = np.where(hot, sub, 0.0)
+        col_times = times[col_mask]
+
+        def _quantile_bounds(profile: np.ndarray, coords: np.ndarray):
+            cum = np.cumsum(profile)
+            total = cum[-1]
+            if total <= 0:
+                return None
+            lo_i = int(np.searchsorted(cum, mass_quantile * total, side="left"))
+            hi_i = int(np.searchsorted(cum, (1.0 - mass_quantile) * total, side="left"))
+            hi_i = min(hi_i, coords.size - 1)
+            a, b = float(coords[lo_i]), float(coords[hi_i])
+            # The rendered grid's frequency axis is DESCENDING (image row
+            # order); return direction-agnostic (low, high) bounds.
+            return (a, b) if a <= b else (b, a)
+
+        t_bounds = _quantile_bounds(mass.sum(axis=0), col_times)
+        f_bounds = _quantile_bounds(mass.sum(axis=1), freqs)
+        if t_bounds is None or f_bounds is None:
+            return None
+
+        # A very compact glitch can collapse the quantile bounds onto a single
+        # grid cell; expand degenerate extents by one cell so the box survives
+        # the >0-extent clip in glitch_box.
+        t0, t1 = t_bounds
+        if t1 <= t0:
+            dt = float(times[1] - times[0]) if times.size > 1 else 0.01
+            t0, t1 = t0 - dt / 2.0, t1 + dt / 2.0
+        f_lo, f_hi = f_bounds
+        if f_hi <= f_lo:
+            ratio = float(freqs[1] / freqs[0]) if freqs.size > 1 else 1.1
+            ratio = max(ratio, 1.0 / ratio) if ratio > 0 else 1.1
+            f_lo, f_hi = f_lo / np.sqrt(ratio), f_hi * np.sqrt(ratio)
+
+        return self.glitch_box(t0, t1, f_lo, f_hi)
+
+    def box_area_fraction(self, box: TimeFrequencyBox) -> float:
+        """Fraction of the image area the box covers (log-frequency aware)."""
+        t_frac = max(0.0, box.time_end - box.time_start) / self.duration
+        u_low = float(freq_to_unit(box.freq_low, self.frange_low, self.frange_high, self.scale))
+        u_high = float(freq_to_unit(box.freq_high, self.frange_low, self.frange_high, self.scale))
+        return t_frac * max(0.0, u_high - u_low)
+
     def glitch_box(
         self, start_time: float, end_time: float, low_freq: float, high_freq: float
     ) -> Optional[TimeFrequencyBox]:
