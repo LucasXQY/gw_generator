@@ -626,6 +626,80 @@ class OffSourceBackgroundTests(unittest.TestCase):
             with self.assertRaisesRegex(GlitchFetchError, "assign_split_groups"):
                 provider.sample_background(np.random.default_rng(0), "H1", split="train")
 
+    def test_background_gps_comes_from_deterministic_grid(self):
+        from split_source_groups import offsource_candidate_gps
+
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            assignment = provider.assign_split_groups(self.RATIOS, seed=5)
+            split = self._split_with_h1_groups(assignment)
+            cfg = provider.config
+            grid = set()
+            for group, s in assignment.items():
+                if s == split and group.startswith("H1:"):
+                    grid.update(offsource_candidate_gps(
+                        group, cfg.glitch_fetch_halfwin, cfg.offsource_grid_step
+                    ))
+            rng = np.random.default_rng(3)
+            for _ in range(6):
+                bg = provider.sample_background(rng, "H1", split=split)
+                self.assertIn(bg.gps, grid)
+
+
+class PrefetchOffsourceTests(unittest.TestCase):
+    """Bulk off-source prefetch: ONE whole-file download per (detector, file),
+    all grid candidates cut locally; the build then samples fully offline."""
+
+    RATIOS = {"train": 0.5, "val": 0.25, "test": 0.25}
+
+    def test_prefetch_downloads_each_file_once_and_enables_offline_sampling(self):
+        from prefetch_offsource_cache import prefetch_offsource
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _make_config(
+                tmp,
+                glitch_metadata_csv=_write_pool(
+                    tmp / "pool.csv",
+                    gps_h1=_spread_pool_gps(n_files=2),
+                    gps_l1=_spread_pool_gps(n_files=2, first_file=275100),
+                ),
+            )
+            provider = RealGlitchProvider(cfg)
+            calls = []
+
+            def fake_fetch(det, gps, hw):
+                calls.append((det, gps, hw))
+                n = int(2 * hw * provider.sr)
+                return np.random.default_rng(len(calls)).normal(0.0, 1.0, n)
+
+            provider._gwosc_fetch = fake_fetch
+            stats = prefetch_offsource(provider, per_file=3, log=lambda *a: None)
+
+            # One whole-file fetch per (detector, 4096 s file): 2 det x 2 files.
+            self.assertEqual(len(calls), 4)
+            for _det, _gps, hw in calls:
+                self.assertEqual(hw, FILE_SECONDS / 2.0)
+            self.assertEqual(stats["segments_cached"], 4 * 3)
+
+            # Re-running is a no-op (resumable).
+            stats2 = prefetch_offsource(provider, per_file=3, log=lambda *a: None)
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(stats2["segments_cached"], 0)
+
+            # Sampling now works with the network dead.
+            def no_network(det, gps, hw):
+                raise AssertionError("network hit during offline sampling")
+
+            provider._gwosc_fetch = no_network
+            assignment = provider.assign_split_groups(self.RATIOS, seed=5)
+            split = next(
+                s for g, s in assignment.items() if g.startswith("H1:")
+            )
+            bg = provider.sample_background(np.random.default_rng(0), "H1", split=split)
+            self.assertEqual(bg.noise_type, "real_gwosc_offsource")
+            self.assertEqual(bg.series.size, cfg.n_samples)
+
 
 class OffSourceBuildConfigTests(unittest.TestCase):
     def test_noise_source_is_validated(self):

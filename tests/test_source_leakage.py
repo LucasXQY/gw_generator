@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 from split_source_groups import (  # noqa: E402
     FILE_SECONDS,
     assign_groups_to_splits,
+    offsource_candidate_gps,
     source_group,
 )
 from validation import (  # noqa: E402
@@ -135,6 +136,26 @@ class AssignGroupsToSplitsTests(unittest.TestCase):
         total = sum(counts.values())
         for split, ratio in self.RATIOS.items():
             self.assertAlmostEqual(counts[split] / total, ratio, delta=0.10)
+
+
+class OffsourceGridTests(unittest.TestCase):
+    """Off-source candidate GPS come from a deterministic per-file grid so a
+    bulk prefetch and the build-time sampler always agree on cache keys."""
+
+    def test_grid_deterministic_interior_and_increasing(self):
+        pts = offsource_candidate_gps("H1:274965", halfwin=4.0, step=32.0)
+        self.assertEqual(
+            list(pts), list(offsource_candidate_gps("H1:274965", halfwin=4.0, step=32.0))
+        )
+        base = 274965 * FILE_SECONDS
+        self.assertTrue(all(base + 4.0 <= p <= base + FILE_SECONDS - 4.0 for p in pts))
+        self.assertTrue(all(b > a for a, b in zip(pts, pts[1:])))
+        self.assertGreater(len(pts), 100)
+
+    def test_grid_depends_only_on_file_id(self):
+        h1 = offsource_candidate_gps("H1:500000", halfwin=4.0, step=32.0)
+        l1 = offsource_candidate_gps("L1:500000", halfwin=4.0, step=32.0)
+        self.assertEqual(list(h1), list(l1))
 
 
 class GlitchLeakageValidatorTests(unittest.TestCase):

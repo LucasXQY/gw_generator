@@ -36,7 +36,12 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from config import DatasetConfig
-from split_source_groups import FILE_SECONDS, assign_groups_to_splits, source_group
+from split_source_groups import (
+    FILE_SECONDS,
+    assign_groups_to_splits,
+    offsource_candidate_gps,
+    source_group,
+)
 
 
 class GlitchFetchError(RuntimeError):
@@ -121,6 +126,8 @@ class RealGlitchProvider:
         self.pool: Dict[str, List[dict]] = self._load_pool()
         # 4096 s source-group -> split assignment (set via assign_split_groups).
         self.split_groups: Dict[str, str] = {}
+        # Memoized glitch-excluded off-source grid per (detector, group).
+        self._offsource_candidates: Dict[tuple, tuple] = {}
         # GPS keys known to be unavailable in GWOSC open data (skip on resample).
         # Persisted next to the cache so restarted runs do not re-fetch them.
         self._unavailable: set = self._load_unavailable()
@@ -217,6 +224,25 @@ class RealGlitchProvider:
         ]
 
     # ------------------------------------------------ off-source backgrounds
+    def offsource_candidates(self, detector: str, group: str) -> tuple:
+        """Deterministic off-source GPS grid for ``group``, with every point
+        within ``background_glitch_exclusion`` seconds of a known pool glitch
+        removed. Memoized (the pool is immutable for a provider's lifetime)."""
+        key = (detector, group)
+        if key not in self._offsource_candidates:
+            exclusion = float(self.config.background_glitch_exclusion)
+            glitch_gps = [float(r["gps"]) for r in self.pool[detector]]
+            grid = offsource_candidate_gps(
+                group,
+                float(self.config.glitch_fetch_halfwin),
+                float(self.config.offsource_grid_step),
+            )
+            self._offsource_candidates[key] = tuple(
+                g for g in grid
+                if all(abs(g - x) >= exclusion for x in glitch_gps)
+            )
+        return self._offsource_candidates[key]
+
     def sample_background(
         self, rng, detector: str, split: Optional[str] = None
     ) -> RealBackground:
@@ -249,22 +275,20 @@ class RealGlitchProvider:
                 f"no off-source 4096 s source groups for {detector} in split "
                 f"{split!r}"
             )
-        halfwin = float(self.config.glitch_fetch_halfwin)
-        exclusion = float(self.config.background_glitch_exclusion)
-        glitch_gps = [float(r["gps"]) for r in self.pool[detector]]
         last_exc: Optional[Exception] = None
         for _ in range(64):
             group = eligible[int(rng.integers(len(eligible)))]
-            fid = int(group.split(":", 1)[1])
-            lo = fid * FILE_SECONDS + halfwin
-            hi = (fid + 1) * FILE_SECONDS - halfwin
-            if hi <= lo:
+            valid = [
+                g for g in self.offsource_candidates(detector, group)
+                if self._key(detector, g) not in self._unavailable
+            ]
+            if not valid:
                 continue
-            gps = float(rng.uniform(lo, hi))
-            if any(abs(gps - g) < exclusion for g in glitch_gps):
-                continue
-            if self._key(detector, gps) in self._unavailable:
-                continue
+            # Offline-first: prefer candidates already in the cache (bulk
+            # prefetch), falling back to network fetches only when none are.
+            cached = [g for g in valid if self.cache_npy_path(detector, g).exists()]
+            pick_from = cached if cached else valid
+            gps = pick_from[int(rng.integers(len(pick_from)))]
             try:
                 raw = self._fetch_segment(detector, gps)
                 series, _pos = self._extract_segment(detector, gps, raw, rng)
@@ -375,18 +399,14 @@ class RealGlitchProvider:
         halfwin = float(self.config.glitch_fetch_halfwin)
         return self.cache_dir / f"{detector}_{gps:.4f}_{self.sr}_{halfwin:g}.npy"
 
-    def _fetch_segment(self, detector: str, gps: float) -> np.ndarray:
-        """Fetch (or load from cache) the resampled raw strain around ``gps``."""
+    def cache_store(self, detector: str, gps: float, data: np.ndarray) -> Path:
+        """Write a raw segment (float32 npy + JSON sidecar) into the cache
+        under the canonical key for ``(detector, gps)``."""
         halfwin = float(self.config.glitch_fetch_halfwin)
         npy = self.cache_npy_path(detector, gps)
-        meta = npy.with_suffix(".json")
-        if npy.exists():
-            return np.load(npy)
-
-        data = self._gwosc_fetch(detector, gps, halfwin)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        np.save(npy, data.astype(np.float32))
-        meta.write_text(
+        np.save(npy, np.asarray(data, dtype=np.float32))
+        npy.with_suffix(".json").write_text(
             json.dumps(
                 {
                     "detector": detector,
@@ -395,11 +415,21 @@ class RealGlitchProvider:
                     "halfwin": halfwin,
                     "start": gps - halfwin,
                     "end": gps + halfwin,
-                    "n": int(data.size),
+                    "n": int(np.asarray(data).size),
                 }
             ),
             encoding="utf-8",
         )
+        return npy
+
+    def _fetch_segment(self, detector: str, gps: float) -> np.ndarray:
+        """Fetch (or load from cache) the resampled raw strain around ``gps``."""
+        halfwin = float(self.config.glitch_fetch_halfwin)
+        npy = self.cache_npy_path(detector, gps)
+        if npy.exists():
+            return np.load(npy)
+        data = self._gwosc_fetch(detector, gps, halfwin)
+        self.cache_store(detector, gps, data)
         return data
 
     def _gwosc_fetch(self, detector: str, gps: float, halfwin: float) -> np.ndarray:

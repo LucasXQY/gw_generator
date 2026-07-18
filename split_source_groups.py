@@ -29,6 +29,25 @@ def source_group(ifo: str, gps) -> str:
     return f"{ifo}:{int(float(gps) // FILE_SECONDS)}"
 
 
+def offsource_candidate_gps(group: str, halfwin: float, step: float):
+    """Deterministic off-source GPS grid inside one 4096 s file.
+
+    Points start ``halfwin`` inside the file (the fetch window never crosses
+    into a neighboring file) and advance by ``step``. A bulk prefetch and the
+    build-time sampler share this grid, so prefetched cache entries are the
+    exact GPS values the sampler will request.
+    """
+    fid = int(group.split(":", 1)[1])
+    lo = fid * FILE_SECONDS + float(halfwin)
+    hi = (fid + 1) * FILE_SECONDS - float(halfwin)
+    points = []
+    gps = lo
+    while gps <= hi:
+        points.append(gps)
+        gps += float(step)
+    return tuple(points)
+
+
 def assign_groups_to_splits(
     rows: Iterable[Mapping],
     ratios: Mapping[str, float],

@@ -402,6 +402,9 @@ class DatasetConfig:
     # pass while >=12 sigma transients (ratio >= ~100) are rejected; the
     # label-time gate stays at glitch_box_from_ridge's default 5x.
     background_veto_floor_gate: float = 15.0
+    # Spacing (s) of the deterministic off-source candidate grid inside each
+    # 4096 s file (shared by prefetch_offsource_cache and the sampler).
+    offsource_grid_step: float = 32.0
 
     # --------------------------------------------------------------- image / label output
     save_raw_outputs: bool = True
