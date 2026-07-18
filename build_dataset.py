@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -40,12 +42,35 @@ from injection import inject_chirp
 from label_generator import LabelGenerator, TimeFrequencyBox
 from noise_generator import NoiseGenerator
 from real_glitch import GlitchDependencyError, GlitchFetchError, RealGlitchProvider
+from split_source_groups import FILE_SECONDS, source_group
 from pairs import PairBuilder
 from preprocessing import Preprocessor
 from protocols import write_gw_data_yaml, write_task_protocols
 from qtransform import QTransformRenderer
 from validation import run_all_validations
 from waveform_generator import WaveformGenerator
+
+
+def _code_commit() -> str:
+    """Best-effort git commit of the generator code (D3 provenance)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        sha = out.stdout.strip()
+        if out.returncode == 0 and sha:
+            dirty = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent),
+                 "status", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if dirty.returncode == 0 and dirty.stdout.strip():
+                return f"{sha}-dirty"
+            return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
 
 
 def class_to_signal_type(global_class: str) -> str:
@@ -134,6 +159,13 @@ class DatasetBuilder:
         self._prepare_directories()
         self._write_dataset_config()
         split_assignment = self._event_split_assignment()
+        if self.real_glitch_provider is not None:
+            # Partition GWOSC 4096 s source files across splits BEFORE any
+            # event is built; a source file never serves more than one split.
+            self.real_glitch_provider.assign_split_groups(
+                self.config.split_ratios(), self.config.seed
+            )
+            self._check_split_pool_coverage(split_assignment)
 
         meta_path = self.root / "metadata.csv"
         event_path = self.root / "event_metadata.csv"
@@ -182,6 +214,58 @@ class DatasetBuilder:
         write_task_protocols(self.config, self.root)
         write_gw_data_yaml(self.config, self.root)
         self._write_glitch_catalog_used()
+        self._write_source_groups_manifest()
+
+    def _check_split_pool_coverage(self, split_assignment: List[str]) -> None:
+        """Fail fast when a populated split has no source groups to draw from."""
+        provider = self.real_glitch_provider
+        for split in sorted(set(split_assignment)):
+            for detector in self.config.detectors:
+                if not provider.pool_rows(detector, split):
+                    raise GlitchFetchError(
+                        f"split '{split}' has no 4096 s source group for "
+                        f"{detector}: the glitch pool spans too few GWOSC "
+                        "source files to isolate every split; enlarge the pool "
+                        "(select_pool_subset) or adjust split ratios."
+                    )
+
+    def _write_source_groups_manifest(self) -> None:
+        """D1 bookkeeping: group->split assignment plus per-split usage/reuse."""
+        provider = self.real_glitch_provider
+        if provider is None or not provider.split_groups:
+            return
+        per_split: Dict[str, dict] = {}
+        for r in self._meta_rows:
+            group = str(r.get("glitch_source_group", "") or "")
+            if not group:
+                continue
+            info = per_split.setdefault(
+                str(r["split"]),
+                {"groups_used": set(), "glitch_samples": 0, "glitch_id_reuse": {}},
+            )
+            info["groups_used"].add(group)
+            info["glitch_samples"] += 1
+            gid = str(r["glitch_id"])
+            info["glitch_id_reuse"][gid] = info["glitch_id_reuse"].get(gid, 0) + 1
+        manifest = {
+            "file_seconds": FILE_SECONDS,
+            "seed": self.config.seed,
+            "assignment": provider.split_groups,
+            "per_split": {
+                split: {
+                    "groups_assigned": sorted(
+                        g for g, s in provider.split_groups.items() if s == split
+                    ),
+                    "groups_used": sorted(info["groups_used"]),
+                    "glitch_samples": info["glitch_samples"],
+                    "unique_glitch_ids": len(info["glitch_id_reuse"]),
+                    "glitch_id_reuse": info["glitch_id_reuse"],
+                }
+                for split, info in sorted(per_split.items())
+            },
+        }
+        path = self.root / "source_groups.json"
+        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def _write_glitch_catalog_used(self) -> None:
         """One row per injected glitch (details of every glitch actually used)."""
@@ -189,6 +273,7 @@ class DatasetBuilder:
             "sample_id", "split", "detector", "glitch_source", "glitch_id",
             "glitch_type", "glitch_gps", "glitch_snr_catalog", "glitch_amplitude",
             "glitch_start_time", "glitch_end_time", "glitch_low_freq", "glitch_high_freq",
+            "glitch_source_group",
         ]
         rows = [
             {k: r.get(k, "") for k in fields}
@@ -198,7 +283,7 @@ class DatasetBuilder:
         self._write_csv("glitch_catalog_used.csv", fields, rows)
 
     # --------------------------------------------------------- real glitch
-    def _acquire_real_glitch(self, rng, detector: str):
+    def _acquire_real_glitch(self, rng, detector: str, split: str):
         """Sample a real glitch segment that shows a localized energy ridge.
 
         The box is measured on the glitch-only render (the real segment, no
@@ -214,7 +299,9 @@ class DatasetBuilder:
         last_exc: Optional[Exception] = None
         for _ in range(max(1, cfg.max_glitch_attempts)):
             try:
-                glitch = self.real_glitch_provider.sample_glitch(rng, detector)
+                glitch = self.real_glitch_provider.sample_glitch(
+                    rng, detector, split=split
+                )
             except GlitchDependencyError as exc:
                 last_exc = exc
                 break  # environment error (e.g. gwpy missing) won't fix on retry
@@ -237,6 +324,41 @@ class DatasetBuilder:
         msg = (
             f"could not obtain a real glitch with a detectable ridge for {detector} "
             f"after {cfg.max_glitch_attempts} attempts"
+        )
+        if last_exc is not None:
+            raise GlitchFetchError(f"{msg}: {last_exc}") from last_exc
+        raise GlitchFetchError(msg)
+
+    # ----------------------------------------------- real off-source background
+    def _acquire_real_background(self, rng, detector: str, split: str):
+        """Draw a real off-source background whose render shows NO significant
+        transient (inverted ridge veto). Rejection-samples up to
+        ``max_background_attempts``; on exhaustion raises -- never a silent
+        synthetic fallback (D2)."""
+        cfg = self.config
+        last_exc: Optional[Exception] = None
+        for _ in range(max(1, cfg.max_background_attempts)):
+            try:
+                bg = self.real_glitch_provider.sample_background(
+                    rng, detector, split=split
+                )
+            except GlitchDependencyError:
+                raise
+            except GlitchFetchError as exc:
+                last_exc = exc
+                continue
+            trial = self.preprocessor.preprocess(bg.series)
+            stats = self.qtransform_renderer.energy_stats(trial)
+            box = self.label_generator.glitch_box_from_ridge(
+                stats.energy, stats.freqs, stats.times,
+                (0.0, cfg.duration), cfg.label_ridge_threshold,
+                floor_gate=cfg.background_veto_floor_gate,
+            )
+            if box is None:
+                return bg
+        msg = (
+            f"could not obtain a clean off-source background for {detector} in "
+            f"split '{split}' after {cfg.max_background_attempts} attempts"
         )
         if last_exc is not None:
             raise GlitchFetchError(f"{msg}: {last_exc}") from last_exc
@@ -304,16 +426,34 @@ class DatasetBuilder:
             bg = self.noise_generator.background_noise(rng)
             series = bg.series.copy()
             noise_id, noise_type = bg.noise_id, bg.noise_type
+            background_source = "synthetic"
+            background_group = background_gps = ""
+            noise_reference = bg.series
+            if cfg.noise_source == "gwosc" and not (
+                has_glitch and self.real_glitch_provider is not None
+            ):
+                # D2: non-glitch samples sit on real off-source backgrounds
+                # from the SAME split source-group pool as the glitches.
+                # (Real-glitch samples get their background from the glitch
+                # segment itself below.)
+                real_bg = self._acquire_real_background(rng, detector, split)
+                series = real_bg.series.copy()
+                noise_id, noise_type = real_bg.noise_id, real_bg.noise_type
+                background_source = "gwosc"
+                background_group = real_bg.group
+                background_gps = real_bg.gps
+                noise_reference = real_bg.series
 
             boxes: List[TimeFrequencyBox] = []
             glitch_id = glitch_type = ""
             glitch_start = glitch_end = glitch_cf = glitch_lf = glitch_hf = glitch_amp = ""
             glitch_source = glitch_gps = glitch_snr_cat = ""
+            glitch_group = ""
             if has_glitch:
                 glitch_trial_box = None
                 if self.real_glitch_provider is not None:
                     glitch, glitch_trial_box, _used_synth = self._acquire_real_glitch(
-                        rng, detector
+                        rng, detector, split
                     )
                 else:
                     glitch = self.noise_generator.sample_glitch(rng)
@@ -323,6 +463,10 @@ class DatasetBuilder:
                     # floors into a broadband pedestal across the window).
                     series = glitch.series.copy()
                     noise_id, noise_type = glitch.glitch_id, "real_gwosc"
+                    glitch_group = source_group(detector, glitch.gps)
+                    background_source = "gwosc"
+                    background_group = glitch_group
+                    background_gps = glitch.gps
                 else:
                     series = series + glitch.series
                 glitch_id, glitch_type = glitch.glitch_id, glitch.glitch_type
@@ -379,10 +523,11 @@ class DatasetBuilder:
                     time_delay=td,
                     amp_scale=amp,
                     sign_flip=sign_flip,
-                    # SNR scaling must see the glitch-free noise: a loud glitch
-                    # in ``series`` inflates the std and the chirp comes out
-                    # louder than the requested target SNR.
-                    noise_reference=bg.series,
+                    # SNR scaling must see the glitch-free noise that actually
+                    # underlies (or stands in for) this sample's background: a
+                    # loud glitch in ``series`` inflates the std and the chirp
+                    # comes out louder than the requested target SNR.
+                    noise_reference=noise_reference,
                 )
                 raw = injected.combined
                 target_snr = det_target
@@ -552,6 +697,10 @@ class DatasetBuilder:
                 "glitch_snr_catalog": (
                     _fmt(glitch_snr_cat) if (has_glitch and glitch_snr_cat != "") else ""
                 ),
+                "glitch_source_group": glitch_group,
+                "background_source": background_source,
+                "background_source_group": background_group,
+                "background_gps": _fmt(background_gps) if background_gps != "" else "",
                 "sample_rate": cfg.sample_rate,
                 "duration": _fmt(cfg.duration),
                 "n_samples": cfg.n_samples,
@@ -623,9 +772,19 @@ class DatasetBuilder:
                     (self.root / sub / split / det).mkdir(parents=True, exist_ok=True)
 
     def _write_dataset_config(self) -> None:
-        """Dump the full DatasetConfig for reproducibility/provenance."""
+        """Dump the full DatasetConfig for reproducibility/provenance.
+
+        D3: also pins the glitch-pool contents (SHA256) and the generator
+        code commit, so a dataset can always be matched to exactly what
+        built it.
+        """
         data = asdict(self.config)
         data["output_dir"] = str(self.config.output_dir)
+        if self.config.glitch_metadata_csv is not None:
+            pool = Path(self.config.glitch_metadata_csv)
+            if pool.exists():
+                data["pool_sha256"] = hashlib.sha256(pool.read_bytes()).hexdigest()
+        data["code_commit"] = _code_commit()
         (self.root / "dataset_config.json").write_text(
             json.dumps(data, indent=2, default=str), encoding="utf-8"
         )
@@ -705,6 +864,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Resample a real glitch up to N times if no ridge is found.")
     p.add_argument("--glitch-max-box-frac", type=float, default=None,
                    help="Reject real-glitch boxes covering more than this image fraction.")
+    # --- real (GWOSC) off-source backgrounds (G1/D2)
+    p.add_argument("--noise-source", choices=["synthetic", "gwosc"], default="synthetic",
+                   help="synthetic colored Gaussian (default) or real GWOSC "
+                        "off-source segments for non-glitch samples.")
+    p.add_argument("--max-background-attempts", type=int, default=None,
+                   help="Reject/resample off-source candidates up to N times, "
+                        "then fail explicitly (no synthetic fallback).")
+    p.add_argument("--background-glitch-exclusion", type=float, default=None,
+                   help="Exclude off-source GPS within this many seconds of a "
+                        "known pool glitch.")
+    p.add_argument("--background-veto-floor-gate", type=float, default=None,
+                   help="Reject off-source candidates whose render has pixels "
+                        "above this multiple of the median energy.")
     p.add_argument("--glitch-allow-synthetic-fallback", action="store_true", default=False,
                    help="Fall back to synthetic when GWOSC/gwpy fails or no ridge is found.")
     return p.parse_args(argv)
@@ -737,7 +909,14 @@ def config_from_args(args: argparse.Namespace) -> DatasetConfig:
         glitch_source=args.glitch_source,
         glitch_whiten=args.glitch_whiten,
         glitch_allow_synthetic_fallback=args.glitch_allow_synthetic_fallback,
+        noise_source=args.noise_source,
     )
+    if args.max_background_attempts is not None:
+        kwargs["max_background_attempts"] = args.max_background_attempts
+    if args.background_glitch_exclusion is not None:
+        kwargs["background_glitch_exclusion"] = args.background_glitch_exclusion
+    if args.background_veto_floor_gate is not None:
+        kwargs["background_veto_floor_gate"] = args.background_veto_floor_gate
     if args.injection_time_min is not None:
         kwargs["injection_time_min"] = args.injection_time_min
     if args.injection_time_max is not None:

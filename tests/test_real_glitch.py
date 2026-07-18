@@ -27,6 +27,13 @@ from real_glitch import (  # noqa: E402
     GlitchUnavailableError,
     RealGlitchProvider,
 )
+from split_source_groups import FILE_SECONDS, source_group  # noqa: E402
+from validation import (  # noqa: E402
+    validate_background_domain_decoupled,
+    validate_no_background_group_leakage,
+    validate_no_glitch_leakage,
+    validate_no_source_group_leakage,
+)
 
 
 def _write_pool(path: Path, gps_h1=(1126259462.0, 1126259500.0),
@@ -50,11 +57,14 @@ def _make_config(tmp: Path, **overrides) -> DatasetConfig:
         num_events=1,
         output_dir=tmp / "out",
         glitch_source="gwosc",
-        glitch_metadata_csv=_write_pool(tmp / "pool.csv"),
         glitch_whiten=False,
         glitch_amplitude_range=(5.0, 5.0),
     )
     kwargs.update(overrides)
+    if "glitch_metadata_csv" not in overrides:
+        # Written lazily so an override's pool file is never clobbered by
+        # the default pool sharing the same path.
+        kwargs["glitch_metadata_csv"] = _write_pool(tmp / "pool.csv")
     return DatasetConfig(**kwargs)
 
 
@@ -279,9 +289,30 @@ class PrefetchPoolTests(unittest.TestCase):
             self.assertEqual(counts["skipped_unavailable"], 1)
 
 
+def _spread_pool_gps(n_files=6, per_file=2, first_file=274960):
+    """GPS times spanning ``n_files`` distinct 4096 s GWOSC files."""
+    return tuple(
+        (first_file + i) * 4096.0 + off
+        for i in range(n_files)
+        for off in (100.0, 900.0)[:per_file]
+    )
+
+
+_POOL_GPS = set(_spread_pool_gps()) | set(_spread_pool_gps(first_file=275100))
+
+
+def _fetch_spike_only_at_pool_gps(self, det, gps, hw):
+    """Fake GWOSC fetch: a loud transient at pool glitch GPS times, pure
+    noise elsewhere (so off-source background candidates come out clean)."""
+    peak = 50.0 if gps in _POOL_GPS else 0.0
+    return _segment_with_spike(self.config, peak=peak, seed=int(gps) % 2**16)
+
+
 class GwoscBuildIntegrationTests(unittest.TestCase):
     """Full offline build with a monkeypatched GWOSC fetch: real-glitch boxes
-    must hug the glitch, not the whole image."""
+    must hug the glitch, not the whole image; glitch source groups must be
+    split-isolated and recorded; clean/pure_noise samples must sit on real
+    off-source backgrounds (D2 domain decoupling)."""
 
     @classmethod
     def setUpClass(cls):
@@ -292,16 +323,19 @@ class GwoscBuildIntegrationTests(unittest.TestCase):
             num_events=10,
             seed=11,
             qtransform_backend="scipy",
+            noise_source="gwosc",
             glitch_amplitude_range=(8.0, 8.0),
+            glitch_metadata_csv=_write_pool(
+                tmp / "pool.csv",
+                gps_h1=_spread_pool_gps(),
+                gps_l1=_spread_pool_gps(first_file=275100),
+            ),
         )
 
         from build_dataset import DatasetBuilder
 
         original = RealGlitchProvider._gwosc_fetch
-        RealGlitchProvider._gwosc_fetch = (
-            lambda self, det, gps, hw: _segment_with_spike(self.config, peak=50.0,
-                                                           seed=int(gps) % 2**16)
-        )
+        RealGlitchProvider._gwosc_fetch = _fetch_spike_only_at_pool_gps
         try:
             builder = DatasetBuilder(cls.cfg, use_pycbc=False)
             builder.build()
@@ -344,6 +378,313 @@ class GwoscBuildIntegrationTests(unittest.TestCase):
             cf = float(r["glitch_center_freq"])
             self.assertTrue(lf <= cf <= hf,
                             f"{r['sample_id']}: cf={cf} outside [{lf},{hf}]")
+
+    # ---- G1: source-group isolation of the built dataset
+
+    def test_glitch_source_group_column_matches_gps(self):
+        for r in self.glitch_rows:
+            expected = source_group(r["detector"], r["glitch_gps"])
+            self.assertEqual(
+                r["glitch_source_group"], expected,
+                f"{r['sample_id']}: glitch_source_group={r['glitch_source_group']!r}",
+            )
+
+    def test_built_dataset_has_no_glitch_or_group_leakage(self):
+        self.assertTrue(validate_no_glitch_leakage(self.meta))
+        self.assertTrue(validate_no_source_group_leakage(self.meta))
+
+    def test_background_provenance_fields(self):
+        # Real-glitch samples: the glitch's own segment IS the background.
+        # (Clean rows are covered by test_clean_rows_have_real_offsource_background.)
+        for r in self.glitch_rows:
+            self.assertEqual(r["background_source"], "gwosc", r["sample_id"])
+            self.assertEqual(
+                r["background_source_group"], r["glitch_source_group"], r["sample_id"]
+            )
+            self.assertEqual(r["background_gps"], r["glitch_gps"], r["sample_id"])
+
+    def test_source_groups_manifest_written_and_disjoint(self):
+        import json
+
+        manifest_path = self.cfg.output_dir / "source_groups.json"
+        self.assertTrue(manifest_path.exists(), "source_groups.json missing")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assignment = manifest["assignment"]
+        # Every used group is listed and assigned to the split it served.
+        for r in self.glitch_rows:
+            grp = r["glitch_source_group"]
+            self.assertEqual(assignment[grp], r["split"], grp)
+        # Per-split bookkeeping: sample counts and glitch_id reuse.
+        per_split = manifest["per_split"]
+        n_glitch_rows = sum(
+            info["glitch_samples"] for info in per_split.values()
+        )
+        self.assertEqual(n_glitch_rows, len(self.glitch_rows))
+        for info in per_split.values():
+            self.assertEqual(
+                sum(info["glitch_id_reuse"].values()), info["glitch_samples"]
+            )
+
+    # ---- G1/D2: real off-source backgrounds for non-glitch samples
+
+    def test_clean_rows_have_real_offsource_background(self):
+        clean_rows = [r for r in self.meta if r["has_glitch"] != "1"]
+        self.assertTrue(clean_rows)
+        pool_gps = sorted(_POOL_GPS)
+        for r in clean_rows:
+            self.assertEqual(r["background_source"], "gwosc", r["sample_id"])
+            self.assertEqual(r["noise_type"], "real_gwosc_offsource", r["sample_id"])
+            gps = float(r["background_gps"])
+            group = r["background_source_group"]
+            self.assertEqual(group, source_group(r["detector"], gps))
+            # Same split's source-group pool (D2): group must be assigned to
+            # this row's split.
+            import json
+
+            manifest = json.loads(
+                (self.cfg.output_dir / "source_groups.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["assignment"][group], r["split"], group)
+            # Known glitches excluded by at least 8 s.
+            nearest = min(abs(gps - g) for g in pool_gps)
+            self.assertGreaterEqual(
+                nearest, 8.0, f"{r['sample_id']}: off-source gps {gps} within "
+                f"8 s of a pool glitch",
+            )
+            # Fetch window stays inside the group's 4096 s file.
+            offset = gps % FILE_SECONDS
+            hw = float(self.cfg.glitch_fetch_halfwin)
+            self.assertGreaterEqual(offset, hw, r["sample_id"])
+            self.assertLessEqual(offset, FILE_SECONDS - hw, r["sample_id"])
+
+    def test_background_domain_decoupled_and_groups_isolated(self):
+        self.assertTrue(validate_background_domain_decoupled(self.meta))
+        self.assertTrue(validate_no_background_group_leakage(self.meta))
+
+    def test_dataset_config_records_pool_hash_and_code_commit(self):
+        """D3: dataset_config.json must pin the pool contents and code commit."""
+        import hashlib
+        import json
+
+        cfg_json = json.loads(
+            (self.cfg.output_dir / "dataset_config.json").read_text(encoding="utf-8")
+        )
+        expected = hashlib.sha256(
+            Path(self.cfg.glitch_metadata_csv).read_bytes()
+        ).hexdigest()
+        self.assertEqual(cfg_json["pool_sha256"], expected)
+        self.assertTrue(cfg_json.get("code_commit"))
+
+
+class SplitAwareSamplingTests(unittest.TestCase):
+    """sample_glitch(split=...) must only draw glitches whose 4096 s source
+    group was assigned to that split."""
+
+    RATIOS = {"train": 0.5, "val": 0.25, "test": 0.25}
+
+    def _provider(self, tmp: Path, n_files: int = 4) -> RealGlitchProvider:
+        cfg = _make_config(
+            tmp,
+            glitch_metadata_csv=_write_pool(
+                tmp / "pool.csv",
+                gps_h1=_spread_pool_gps(n_files=n_files),
+                gps_l1=_spread_pool_gps(n_files=n_files, first_file=275100),
+            ),
+        )
+        provider = RealGlitchProvider(cfg)
+        provider._gwosc_fetch = (
+            lambda det, gps, hw: _segment_with_spike(cfg, peak=50.0)
+        )
+        return provider
+
+    def test_assign_split_groups_partitions_every_pool_group(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            assignment = provider.assign_split_groups(self.RATIOS, seed=3)
+            pool_groups = {
+                source_group(det, r["gps"])
+                for det, rows in provider.pool.items()
+                for r in rows
+            }
+            self.assertEqual(set(assignment), pool_groups)
+            self.assertTrue(set(assignment.values()) <= set(self.RATIOS))
+
+    def test_sample_glitch_draws_only_from_the_splits_groups(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            assignment = provider.assign_split_groups(self.RATIOS, seed=3)
+            rng = np.random.default_rng(0)
+            for split in self.RATIOS:
+                if not any(
+                    s == split and g.startswith("H1:") for g, s in assignment.items()
+                ):
+                    continue
+                for _ in range(4):
+                    glitch = provider.sample_glitch(rng, "H1", split=split)
+                    self.assertEqual(
+                        assignment[source_group("H1", glitch.gps)], split
+                    )
+
+    def test_sample_glitch_without_split_is_unrestricted(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            glitch = provider.sample_glitch(np.random.default_rng(0), "H1")
+            self.assertTrue(glitch.glitch_id.startswith("gspy_H1_"))
+
+    def test_split_without_groups_raises_fetch_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            # 2 files per detector cannot cover 3 splits: some split ends up
+            # with an empty H1 pool and sampling from it must fail loudly.
+            provider = self._provider(Path(td), n_files=2)
+            assignment = provider.assign_split_groups(self.RATIOS, seed=3)
+            empty = [
+                split for split in self.RATIOS
+                if not any(
+                    s == split and g.startswith("H1:")
+                    for g, s in assignment.items()
+                )
+            ]
+            self.assertTrue(empty, "expected an uncovered split with 2 files")
+            with self.assertRaisesRegex(GlitchFetchError, empty[0]):
+                provider.sample_glitch(np.random.default_rng(0), "H1", split=empty[0])
+
+    def test_sample_with_split_before_assignment_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            with self.assertRaisesRegex(GlitchFetchError, "assign_split_groups"):
+                provider.sample_glitch(np.random.default_rng(0), "H1", split="train")
+
+
+class OffSourceBackgroundTests(unittest.TestCase):
+    """sample_background draws real off-source segments from the split's own
+    4096 s source groups, away from known glitches and file edges."""
+
+    RATIOS = {"train": 0.5, "val": 0.25, "test": 0.25}
+
+    def _provider(self, tmp: Path, n_files: int = 4) -> RealGlitchProvider:
+        cfg = _make_config(
+            tmp,
+            glitch_metadata_csv=_write_pool(
+                tmp / "pool.csv",
+                gps_h1=_spread_pool_gps(n_files=n_files),
+                gps_l1=_spread_pool_gps(n_files=n_files, first_file=275100),
+            ),
+        )
+        provider = RealGlitchProvider(cfg)
+        provider._gwosc_fetch = (
+            lambda det, gps, hw: _segment_with_spike(cfg, peak=0.0, seed=int(gps) % 2**16)
+        )
+        return provider
+
+    def _split_with_h1_groups(self, assignment):
+        for split in self.RATIOS:
+            if any(s == split and g.startswith("H1:") for g, s in assignment.items()):
+                return split
+        self.fail("no split has H1 groups")
+
+    def test_background_is_full_length_with_unit_robust_floor(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            assignment = provider.assign_split_groups(self.RATIOS, seed=5)
+            split = self._split_with_h1_groups(assignment)
+            bg = provider.sample_background(np.random.default_rng(0), "H1", split=split)
+            self.assertEqual(bg.series.size, provider.n_samples)
+            self.assertEqual(bg.noise_type, "real_gwosc_offsource")
+            med = np.median(bg.series)
+            floor = 1.4826 * np.median(np.abs(bg.series - med))
+            self.assertAlmostEqual(floor, 1.0, delta=0.15)
+
+    def test_background_gps_in_split_groups_and_file_interior(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            assignment = provider.assign_split_groups(self.RATIOS, seed=5)
+            split = self._split_with_h1_groups(assignment)
+            rng = np.random.default_rng(1)
+            hw = float(provider.config.glitch_fetch_halfwin)
+            for _ in range(8):
+                bg = provider.sample_background(rng, "H1", split=split)
+                self.assertEqual(assignment[source_group("H1", bg.gps)], split)
+                offset = bg.gps % FILE_SECONDS
+                self.assertGreaterEqual(offset, hw)
+                self.assertLessEqual(offset, FILE_SECONDS - hw)
+
+    def test_background_avoids_known_glitches_by_8_seconds(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            assignment = provider.assign_split_groups(self.RATIOS, seed=5)
+            split = self._split_with_h1_groups(assignment)
+            pool_gps = [float(r["gps"]) for r in provider.pool["H1"]]
+            rng = np.random.default_rng(2)
+            for _ in range(12):
+                bg = provider.sample_background(rng, "H1", split=split)
+                nearest = min(abs(bg.gps - g) for g in pool_gps)
+                self.assertGreaterEqual(nearest, 8.0)
+
+    def test_background_requires_assignment_for_split(self):
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td))
+            with self.assertRaisesRegex(GlitchFetchError, "assign_split_groups"):
+                provider.sample_background(np.random.default_rng(0), "H1", split="train")
+
+
+class OffSourceBuildConfigTests(unittest.TestCase):
+    def test_noise_source_is_validated(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError):
+                _make_config(Path(td), noise_source="bogus")
+
+    def test_gwosc_noise_forbids_synthetic_glitch_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError):
+                _make_config(
+                    Path(td),
+                    noise_source="gwosc",
+                    glitch_allow_synthetic_fallback=True,
+                )
+
+    def test_transient_candidates_are_rejected_until_explicit_failure(self):
+        """Every off-source candidate renders with a transient: the builder
+        must retry up to max_background_attempts then raise -- never fall
+        back to synthetic noise."""
+        from build_dataset import DatasetBuilder
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _make_config(
+                tmp,
+                noise_source="gwosc",
+                max_background_attempts=2,
+                qtransform_backend="scipy",
+                glitch_metadata_csv=_write_pool(
+                    tmp / "pool.csv",
+                    gps_h1=_spread_pool_gps(),
+                    gps_l1=_spread_pool_gps(first_file=275100),
+                ),
+            )
+            builder = DatasetBuilder(cfg, use_pycbc=False)
+            provider = builder.real_glitch_provider
+            provider._gwosc_fetch = (
+                lambda det, gps, hw: _segment_with_spike(cfg, peak=50.0)
+            )
+            provider.assign_split_groups(cfg.split_ratios(), cfg.seed)
+            with self.assertRaisesRegex(GlitchFetchError, "off-source"):
+                builder._acquire_real_background(
+                    np.random.default_rng(0), "H1", "train"
+                )
+
+
+class SplitPoolCoverageTests(unittest.TestCase):
+    def test_build_fails_fast_when_a_split_has_no_groups(self):
+        """A pool with one 4096 s file per detector cannot serve 3 splits;
+        the builder must refuse before fetching anything."""
+        from build_dataset import DatasetBuilder
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = _make_config(tmp, num_events=6, qtransform_backend="scipy")
+            builder = DatasetBuilder(cfg, use_pycbc=False)
+            with self.assertRaisesRegex(GlitchFetchError, "source group"):
+                builder.build()
 
 
 if __name__ == "__main__":

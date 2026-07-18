@@ -6,11 +6,19 @@ GPS times not in the cache raise, so run prefetch first.
 
     python validate_real_glitch.py --pool gravityspy_pool_3000.csv \
         --output-dir datasets/gw_dataset_3000_real --n 12
+
+Audit mode (G1): run the cross-split leakage + background-domain audits on a
+built dataset's metadata.csv; exits 1 when any audit fails.
+
+    python validate_real_glitch.py --audit --output-dir datasets/<name>
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -19,16 +27,64 @@ from label_generator import LabelGenerator
 from preprocessing import Preprocessor
 from qtransform import QTransformRenderer
 from real_glitch import GlitchFetchError, RealGlitchProvider
+from validation import (
+    validate_background_domain_decoupled,
+    validate_no_background_group_leakage,
+    validate_no_chirp_leakage,
+    validate_no_event_leakage,
+    validate_no_glitch_leakage,
+    validate_no_source_group_leakage,
+)
+
+_AUDITS = (
+    ("event_id leakage", validate_no_event_leakage),
+    ("chirp_id leakage", validate_no_chirp_leakage),
+    ("glitch_id leakage", validate_no_glitch_leakage),
+    ("glitch source_group leakage", validate_no_source_group_leakage),
+    ("background domain collinearity", validate_background_domain_decoupled),
+    ("background source_group leakage", validate_no_background_group_leakage),
+)
+
+
+def _run_audit(output_dir: Path) -> None:
+    meta_path = Path(output_dir) / "metadata.csv"
+    if not meta_path.exists():
+        print(f"AUDIT ERROR: {meta_path} not found")
+        sys.exit(1)
+    with meta_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    print(f"auditing {meta_path} ({len(rows)} rows)")
+    failed = False
+    for name, check in _AUDITS:
+        try:
+            check(rows)
+        except AssertionError as exc:
+            print(f"FAIL {name}: {exc}")
+            failed = True
+        else:
+            print(f"PASS {name}")
+    if failed:
+        sys.exit(1)
 
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--pool", required=True)
+    p.add_argument("--pool", default=None)
     p.add_argument("--output-dir", required=True,
                    help="Build output dir (its glitch_cache/ is used).")
     p.add_argument("--n", type=int, default=12)
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--audit", action="store_true",
+                   help="Audit <output-dir>/metadata.csv for cross-split "
+                        "leakage and background-domain collinearity; exit 1 "
+                        "on failure.")
     args = p.parse_args(argv)
+
+    if args.audit:
+        _run_audit(Path(args.output_dir))
+        return
+    if args.pool is None:
+        p.error("--pool is required unless --audit is given")
 
     cfg = DatasetConfig(
         num_events=1,

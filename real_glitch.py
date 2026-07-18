@@ -36,6 +36,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from config import DatasetConfig
+from split_source_groups import FILE_SECONDS, assign_groups_to_splits, source_group
 
 
 class GlitchFetchError(RuntimeError):
@@ -83,6 +84,20 @@ class RealGlitch:
     source: str = "gwosc"
 
 
+@dataclass
+class RealBackground:
+    """A real off-source GWOSC segment (no known glitch) used as a sample's
+    entire background. Same length and unit robust noise floor as
+    :class:`RealGlitch` segments -- prepared by the identical fetch/whiten/
+    MAD pipeline."""
+
+    series: np.ndarray
+    noise_id: str
+    noise_type: str
+    gps: float
+    group: str
+
+
 def _to_float(value) -> Optional[float]:
     try:
         if value in (None, ""):
@@ -104,6 +119,8 @@ class RealGlitchProvider:
         self.n_samples = int(config.n_samples)
         self.duration = float(config.duration)
         self.pool: Dict[str, List[dict]] = self._load_pool()
+        # 4096 s source-group -> split assignment (set via assign_split_groups).
+        self.split_groups: Dict[str, str] = {}
         # GPS keys known to be unavailable in GWOSC open data (skip on resample).
         # Persisted next to the cache so restarted runs do not re-fetch them.
         self._unavailable: set = self._load_unavailable()
@@ -170,19 +187,129 @@ class RealGlitchProvider:
                 )
         return pool
 
-    # --------------------------------------------------------------- sampling
-    def sample_glitch(self, rng, detector: str) -> RealGlitch:
-        """Randomly pick a pool row for ``detector`` and return a placed glitch.
+    # ------------------------------------------------- split source groups
+    def assign_split_groups(self, ratios, seed: int) -> Dict[str, str]:
+        """Partition the pool's 4096 s source groups across splits (G1/D1).
 
-        Rows whose GPS is known-unavailable in GWOSC open data are skipped. A
-        fetch failure marks that GPS unavailable and re-raises (retryable), so a
-        subsequent call samples a different, hopefully-available glitch.
+        Deterministic in ``seed`` and independent of the builder's shared
+        RNG stream. Must be called before ``sample_glitch(..., split=...)``.
         """
+        rows = [r for det_rows in self.pool.values() for r in det_rows]
+        self.split_groups = assign_groups_to_splits(rows, ratios, seed)
+        return self.split_groups
+
+    def pool_rows(self, detector: str, split: Optional[str] = None) -> List[dict]:
+        """Non-blacklisted pool rows for ``detector``, optionally restricted
+        to the 4096 s source groups assigned to ``split``."""
         rows = [
             r for r in self.pool[detector]
             if self._key(detector, float(r["gps"])) not in self._unavailable
         ]
+        if split is None:
+            return rows
+        if not self.split_groups:
+            raise GlitchFetchError(
+                "split-restricted sampling requires assign_split_groups() first"
+            )
+        return [
+            r for r in rows
+            if self.split_groups.get(source_group(detector, r["gps"])) == split
+        ]
+
+    # ------------------------------------------------ off-source backgrounds
+    def sample_background(
+        self, rng, detector: str, split: Optional[str] = None
+    ) -> RealBackground:
+        """Draw a real off-source segment from ``split``'s own source groups.
+
+        The GPS is uniform inside a randomly chosen assigned 4096 s file,
+        kept ``glitch_fetch_halfwin`` clear of the file edges (the fetch
+        window never crosses into a neighboring file) and at least
+        ``background_glitch_exclusion`` seconds away from every known pool
+        glitch of that detector. Fetch/whiten/MAD normalization is the exact
+        pipeline used for real glitches, so the noise floor contract is
+        identical. Raises :class:`GlitchFetchError` when no clean candidate
+        can be drawn -- there is NO synthetic fallback.
+        """
+        if split is not None and not self.split_groups:
+            raise GlitchFetchError(
+                "split-restricted sampling requires assign_split_groups() first"
+            )
+        if split is None:
+            eligible = sorted(
+                {source_group(detector, r["gps"]) for r in self.pool[detector]}
+            )
+        else:
+            eligible = sorted(
+                g for g, s in self.split_groups.items()
+                if s == split and g.startswith(f"{detector}:")
+            )
+        if not eligible:
+            raise GlitchFetchError(
+                f"no off-source 4096 s source groups for {detector} in split "
+                f"{split!r}"
+            )
+        halfwin = float(self.config.glitch_fetch_halfwin)
+        exclusion = float(self.config.background_glitch_exclusion)
+        glitch_gps = [float(r["gps"]) for r in self.pool[detector]]
+        last_exc: Optional[Exception] = None
+        for _ in range(64):
+            group = eligible[int(rng.integers(len(eligible)))]
+            fid = int(group.split(":", 1)[1])
+            lo = fid * FILE_SECONDS + halfwin
+            hi = (fid + 1) * FILE_SECONDS - halfwin
+            if hi <= lo:
+                continue
+            gps = float(rng.uniform(lo, hi))
+            if any(abs(gps - g) < exclusion for g in glitch_gps):
+                continue
+            if self._key(detector, gps) in self._unavailable:
+                continue
+            try:
+                raw = self._fetch_segment(detector, gps)
+                series, _pos = self._extract_segment(detector, gps, raw, rng)
+            except GlitchDependencyError:
+                raise
+            except GlitchUnavailableError as exc:
+                self._mark_unavailable(detector, gps)
+                last_exc = exc
+                continue  # dead spot; try another GPS
+            # Transient GlitchFetchError propagates (retryable by the caller).
+            return RealBackground(
+                series=series,
+                noise_id=f"offsource_{detector}_{gps:.4f}",
+                noise_type="real_gwosc_offsource",
+                gps=gps,
+                group=source_group(detector, gps),
+            )
+        msg = (
+            f"could not draw an off-source background for {detector} in split "
+            f"{split!r}: glitch-exclusion zones or unavailable data exhausted "
+            "64 candidate draws"
+        )
+        if last_exc is not None:
+            raise GlitchFetchError(f"{msg}: {last_exc}") from last_exc
+        raise GlitchFetchError(msg)
+
+    # --------------------------------------------------------------- sampling
+    def sample_glitch(self, rng, detector: str, split: Optional[str] = None) -> RealGlitch:
+        """Randomly pick a pool row for ``detector`` and return a placed glitch.
+
+        With ``split`` given, only rows whose 4096 s source group was assigned
+        to that split by :meth:`assign_split_groups` are eligible, so a GWOSC
+        source file never serves more than one split. Rows whose GPS is
+        known-unavailable in GWOSC open data are skipped. A fetch failure marks
+        that GPS unavailable and re-raises (retryable), so a subsequent call
+        samples a different, hopefully-available glitch.
+        """
+        rows = self.pool_rows(detector, split)
         if not rows:
+            if split is not None:
+                raise GlitchFetchError(
+                    f"no available pool glitches for {detector} in split "
+                    f"'{split}': its assigned 4096 s source groups are empty or "
+                    "unavailable; enlarge the pool or adjust split ratios."
+                )
             raise GlitchFetchError(
                 f"all pool glitches for {detector} are unavailable in GWOSC open "
                 "data; supply a pool with GPS times inside published open-data "

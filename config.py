@@ -161,6 +161,11 @@ METADATA_FIELDS = (
     "glitch_source",
     "glitch_gps",
     "glitch_snr_catalog",
+    # --- source-group isolation + background provenance (G1)
+    "glitch_source_group",
+    "background_source",
+    "background_source_group",
+    "background_gps",
     # --- acquisition (so a .npy can be loaded without joining other tables)
     "sample_rate",
     "duration",
@@ -380,6 +385,24 @@ class DatasetConfig:
     # injection lit up the background, not a localized glitch.
     glitch_max_box_frac: float = 0.60
 
+    # --- real (GWOSC) off-source backgrounds (G1/D2) ----------------------- #
+    # "synthetic" (colored Gaussian) or "gwosc": non-glitch samples draw real
+    # off-source segments from the SAME split source-group pool as the
+    # glitches, so background domain never correlates with has_glitch.
+    noise_source: str = "synthetic"
+    # Off-source candidates whose render shows a significant ridge box are
+    # rejected and resampled up to this many times, then the build FAILS
+    # explicitly -- never a silent synthetic fallback.
+    max_background_attempts: int = 20
+    # Exclude off-source GPS within this many seconds of any known pool glitch.
+    background_glitch_exclusion: float = 8.0
+    # Significance gate for the off-source transient veto: a candidate is
+    # rejected only when its render has pixels above this multiple of the
+    # median energy. Calibrated so clean-noise renders (peak/median <= ~12)
+    # pass while >=12 sigma transients (ratio >= ~100) are rejected; the
+    # label-time gate stays at glitch_box_from_ridge's default 5x.
+    background_veto_floor_gate: float = 15.0
+
     # --------------------------------------------------------------- image / label output
     save_raw_outputs: bool = True
     save_display_images: bool = True
@@ -467,6 +490,24 @@ class DatasetConfig:
         else:
             self.real_glitch_cache_dir = Path(self.real_glitch_cache_dir)
         self.glitch_amplitude_range = tuple(self.glitch_amplitude_range)
+
+        # ---- real off-source background settings (G1/D2)
+        if self.noise_source not in ("synthetic", "gwosc"):
+            raise ValueError(
+                f"noise_source must be 'synthetic' or 'gwosc', got {self.noise_source!r}"
+            )
+        if self.noise_source == "gwosc":
+            if self.glitch_source != "gwosc":
+                raise ValueError(
+                    "noise_source='gwosc' requires glitch_source='gwosc' (the "
+                    "off-source sampler draws from the glitch pool's source groups)"
+                )
+            if self.glitch_allow_synthetic_fallback:
+                raise ValueError(
+                    "noise_source='gwosc' forbids glitch_allow_synthetic_fallback: "
+                    "a silent synthetic fallback would re-couple background "
+                    "domain with has_glitch"
+                )
 
         # ---- hardcode the frequency coordinate system (window is not configurable)
         self.frange_low = FIXED_FRANGE_LOW
