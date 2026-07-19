@@ -626,6 +626,43 @@ class OffSourceBackgroundTests(unittest.TestCase):
             with self.assertRaisesRegex(GlitchFetchError, "assign_split_groups"):
                 provider.sample_background(np.random.default_rng(0), "H1", split="train")
 
+    def test_cached_candidates_win_over_uncached_groups_split_wide(self):
+        """If ANY of the split's groups has cached candidates, sampling must
+        never touch the network -- even when the randomly drawn group has no
+        cache (e.g. its whole-file prefetch failed)."""
+        from split_source_groups import offsource_candidate_gps
+
+        with tempfile.TemporaryDirectory() as td:
+            provider = self._provider(Path(td), n_files=8)
+            assignment = provider.assign_split_groups(self.RATIOS, seed=5)
+
+            def h1_groups(s):
+                return [g for g, sp in assignment.items()
+                        if sp == s and g.startswith("H1:")]
+
+            split = max(self.RATIOS, key=lambda s: len(h1_groups(s)))
+            groups = h1_groups(split)
+            self.assertGreaterEqual(len(groups), 2, assignment)
+            cfg = provider.config
+            # Cache 3 candidates of ONE group only.
+            seeded = offsource_candidate_gps(
+                groups[0], cfg.glitch_fetch_halfwin, cfg.offsource_grid_step
+            )[:3]
+            n = int(2 * cfg.glitch_fetch_halfwin * provider.sr)
+            for i, gps in enumerate(seeded):
+                provider.cache_store(
+                    "H1", gps, np.random.default_rng(i).normal(0.0, 1.0, n)
+                )
+
+            def no_network(det, gps, hw):
+                raise AssertionError("network hit despite cached candidates")
+
+            provider._gwosc_fetch = no_network
+            rng = np.random.default_rng(0)
+            for _ in range(10):
+                bg = provider.sample_background(rng, "H1", split=split)
+                self.assertIn(bg.gps, set(seeded))
+
     def test_background_gps_comes_from_deterministic_grid(self):
         from split_source_groups import offsource_candidate_gps
 

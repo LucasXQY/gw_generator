@@ -128,6 +128,9 @@ class RealGlitchProvider:
         self.split_groups: Dict[str, str] = {}
         # Memoized glitch-excluded off-source grid per (detector, group).
         self._offsource_candidates: Dict[tuple, tuple] = {}
+        # Memoized cache-existence snapshot per (detector, group): stat() on
+        # /mnt/e is slow, and the off-source cache is static during a build.
+        self._offsource_cached: Dict[tuple, frozenset] = {}
         # GPS keys known to be unavailable in GWOSC open data (skip on resample).
         # Persisted next to the cache so restarted runs do not re-fetch them.
         self._unavailable: set = self._load_unavailable()
@@ -243,6 +246,17 @@ class RealGlitchProvider:
             )
         return self._offsource_candidates[key]
 
+    def _cached_offsource(self, detector: str, group: str) -> frozenset:
+        """Cached off-source candidate GPS for ``group`` (existence snapshot,
+        memoized -- the prefetched cache is static during a build)."""
+        key = (detector, group)
+        if key not in self._offsource_cached:
+            self._offsource_cached[key] = frozenset(
+                g for g in self.offsource_candidates(detector, group)
+                if self.cache_npy_path(detector, g).exists()
+            )
+        return self._offsource_cached[key]
+
     def sample_background(
         self, rng, detector: str, split: Optional[str] = None
     ) -> RealBackground:
@@ -275,20 +289,27 @@ class RealGlitchProvider:
                 f"no off-source 4096 s source groups for {detector} in split "
                 f"{split!r}"
             )
+        # Offline-first across the WHOLE split: if any eligible group has
+        # cached candidates, draw exclusively from those. A group whose
+        # whole-file prefetch failed must never force network fetches while
+        # cached alternatives exist.
+        cached_pool: List[float] = []
+        network_pool: List[float] = []
+        for group in eligible:
+            cached = self._cached_offsource(detector, group)
+            for g in self.offsource_candidates(detector, group):
+                if self._key(detector, g) in self._unavailable:
+                    continue
+                (cached_pool if g in cached else network_pool).append(g)
+        pool = cached_pool if cached_pool else network_pool
+        if not pool:
+            raise GlitchFetchError(
+                f"no available off-source candidates for {detector} in split "
+                f"{split!r}: all grid points excluded or blacklisted"
+            )
         last_exc: Optional[Exception] = None
         for _ in range(64):
-            group = eligible[int(rng.integers(len(eligible)))]
-            valid = [
-                g for g in self.offsource_candidates(detector, group)
-                if self._key(detector, g) not in self._unavailable
-            ]
-            if not valid:
-                continue
-            # Offline-first: prefer candidates already in the cache (bulk
-            # prefetch), falling back to network fetches only when none are.
-            cached = [g for g in valid if self.cache_npy_path(detector, g).exists()]
-            pick_from = cached if cached else valid
-            gps = pick_from[int(rng.integers(len(pick_from)))]
+            gps = pool[int(rng.integers(len(pool)))]
             try:
                 raw = self._fetch_segment(detector, gps)
                 series, _pos = self._extract_segment(detector, gps, raw, rng)
