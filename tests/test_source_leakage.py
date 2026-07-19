@@ -363,17 +363,22 @@ def _read_csv(path: Path):
         return list(csv.DictReader(fh))
 
 
-def _primary_dataset_dir():
-    """Newest COMPLETED v2 dataset if any, else the legacy real dataset.
+def _v2_dataset_dirs():
+    """All COMPLETED v2 datasets. Crashed builds leave partial directories
+    (streaming CSVs) without the BUILD_COMPLETE marker; they must never be
+    audited as datasets."""
+    if not DATASETS.is_dir():
+        return []
+    return sorted(d for d in DATASETS.iterdir()
+                  if d.is_dir() and d.name.startswith("gw_dataset_v2_")
+                  and (d / "BUILD_COMPLETE").exists())
 
-    Crashed builds leave partial directories (streaming CSVs) without the
-    BUILD_COMPLETE marker; they must never be audited as datasets."""
-    if DATASETS.is_dir():
-        v2 = sorted(d for d in DATASETS.iterdir()
-                    if d.is_dir() and d.name.startswith("gw_dataset_v2_")
-                    and (d / "BUILD_COMPLETE").exists())
-        if v2:
-            return v2[-1]
+
+def _primary_dataset_dir():
+    """Any completed v2 dataset wins; else the legacy real dataset."""
+    v2 = _v2_dataset_dirs()
+    if v2:
+        return v2[-1]
     if LEGACY_REAL.is_dir():
         return LEGACY_REAL
     return None
@@ -402,23 +407,28 @@ class KnownLeakyDatasetAuditTests(unittest.TestCase):
 
 @unittest.skipUnless(_primary_dataset_dir() is not None, "no dataset on disk")
 class CurrentPrimaryDatasetAuditTests(unittest.TestCase):
-    """RED until the G1 rebuild: resolves to gw_dataset_3000_real today and
-    fails on its source leakage; once a gw_dataset_v2_* is built it must
-    resolve there and pass."""
+    """RED until the G1 rebuild: with no completed v2 dataset this resolves
+    to gw_dataset_3000_real and fails on its source leakage; afterwards
+    EVERY completed v2 dataset must pass all three audits."""
 
     @classmethod
     def setUpClass(cls):
-        cls.dataset_dir = _primary_dataset_dir()
-        cls.metadata = _read_csv(cls.dataset_dir / "metadata.csv")
+        dirs = _v2_dataset_dirs() or [_primary_dataset_dir()]
+        cls.datasets = [(d.name, _read_csv(d / "metadata.csv")) for d in dirs]
+
+    def _each(self, check):
+        for name, metadata in self.datasets:
+            with self.subTest(dataset=name):
+                self.assertTrue(check(metadata))
 
     def test_primary_dataset_has_no_glitch_id_leakage(self):
-        self.assertTrue(validate_no_glitch_leakage(self.metadata))
+        self._each(validate_no_glitch_leakage)
 
     def test_primary_dataset_has_no_source_group_leakage(self):
-        self.assertTrue(validate_no_source_group_leakage(self.metadata))
+        self._each(validate_no_source_group_leakage)
 
     def test_primary_dataset_background_domain_is_decoupled(self):
-        self.assertTrue(validate_background_domain_decoupled(self.metadata))
+        self._each(validate_background_domain_decoupled)
 
 
 if __name__ == "__main__":
