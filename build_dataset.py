@@ -199,6 +199,13 @@ class DatasetBuilder:
                 self._pair_rows,
                 allow_cross_split=self.config.allow_cross_split_negative_pairs,
             )
+            # Marker = completed AND validated; partial/crashed runs never
+            # get one, so audits can tell datasets from debris.
+            (self.root / "BUILD_COMPLETE").write_text(
+                json.dumps({"num_events": self.config.num_events,
+                            "code_commit": _code_commit()}),
+                encoding="utf-8",
+            )
         return meta_path
 
     def _write_pairs_and_config(self) -> None:
@@ -331,10 +338,13 @@ class DatasetBuilder:
 
     # ----------------------------------------------- real off-source background
     def _acquire_real_background(self, rng, detector: str, split: str):
-        """Draw a real off-source background whose render shows NO significant
-        transient (inverted ridge veto). Rejection-samples up to
-        ``max_background_attempts``; on exhaustion raises -- never a silent
-        synthetic fallback (D2)."""
+        """Draw a real off-source background without a significant transient.
+
+        Veto statistic: the count of loud pixels (energy >=
+        ``background_veto_energy``) in the candidate's render; peak-based
+        gates saturate at the energy clip on real data and cannot
+        discriminate. Rejection-samples up to ``max_background_attempts``;
+        on exhaustion raises -- never a silent synthetic fallback (D2)."""
         cfg = self.config
         last_exc: Optional[Exception] = None
         for _ in range(max(1, cfg.max_background_attempts)):
@@ -349,12 +359,8 @@ class DatasetBuilder:
                 continue
             trial = self.preprocessor.preprocess(bg.series)
             stats = self.qtransform_renderer.energy_stats(trial)
-            box = self.label_generator.glitch_box_from_ridge(
-                stats.energy, stats.freqs, stats.times,
-                (0.0, cfg.duration), cfg.label_ridge_threshold,
-                floor_gate=cfg.background_veto_floor_gate,
-            )
-            if box is None:
+            n_loud = int(np.sum(stats.energy >= cfg.background_veto_energy))
+            if n_loud <= cfg.background_veto_max_pixels:
                 return bg
         msg = (
             f"could not obtain a clean off-source background for {detector} in "
@@ -874,9 +880,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--background-glitch-exclusion", type=float, default=None,
                    help="Exclude off-source GPS within this many seconds of a "
                         "known pool glitch.")
-    p.add_argument("--background-veto-floor-gate", type=float, default=None,
-                   help="Reject off-source candidates whose render has pixels "
-                        "above this multiple of the median energy.")
+    p.add_argument("--background-veto-energy", type=float, default=None,
+                   help="Normalized-energy level counted as 'loud' by the "
+                        "off-source transient veto.")
+    p.add_argument("--background-veto-max-pixels", type=int, default=None,
+                   help="Reject off-source candidates with more loud pixels "
+                        "than this.")
     p.add_argument("--glitch-allow-synthetic-fallback", action="store_true", default=False,
                    help="Fall back to synthetic when GWOSC/gwpy fails or no ridge is found.")
     return p.parse_args(argv)
@@ -915,8 +924,10 @@ def config_from_args(args: argparse.Namespace) -> DatasetConfig:
         kwargs["max_background_attempts"] = args.max_background_attempts
     if args.background_glitch_exclusion is not None:
         kwargs["background_glitch_exclusion"] = args.background_glitch_exclusion
-    if args.background_veto_floor_gate is not None:
-        kwargs["background_veto_floor_gate"] = args.background_veto_floor_gate
+    if args.background_veto_energy is not None:
+        kwargs["background_veto_energy"] = args.background_veto_energy
+    if args.background_veto_max_pixels is not None:
+        kwargs["background_veto_max_pixels"] = args.background_veto_max_pixels
     if args.injection_time_min is not None:
         kwargs["injection_time_min"] = args.injection_time_min
     if args.injection_time_max is not None:

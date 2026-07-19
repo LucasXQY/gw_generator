@@ -364,10 +364,14 @@ def _read_csv(path: Path):
 
 
 def _primary_dataset_dir():
-    """Newest rebuilt v2 dataset if any, else the legacy real dataset."""
+    """Newest COMPLETED v2 dataset if any, else the legacy real dataset.
+
+    Crashed builds leave partial directories (streaming CSVs) without the
+    BUILD_COMPLETE marker; they must never be audited as datasets."""
     if DATASETS.is_dir():
         v2 = sorted(d for d in DATASETS.iterdir()
-                    if d.is_dir() and d.name.startswith("gw_dataset_v2_"))
+                    if d.is_dir() and d.name.startswith("gw_dataset_v2_")
+                    and (d / "BUILD_COMPLETE").exists())
         if v2:
             return v2[-1]
     if LEGACY_REAL.is_dir():

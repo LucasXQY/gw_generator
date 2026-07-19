@@ -324,6 +324,12 @@ class GwoscBuildIntegrationTests(unittest.TestCase):
             seed=11,
             qtransform_backend="scipy",
             noise_source="gwosc",
+            # The loud-pixel veto is calibrated for the gwpy backend on real
+            # strain; the scipy backend's normalization saturates far more
+            # pixels on ANY input. This fixture tests pipeline mechanics, so
+            # disable the veto (its mechanics are covered by
+            # OffSourceBuildConfigTests with background_veto_max_pixels=0).
+            background_veto_max_pixels=640 * 640,
             glitch_amplitude_range=(8.0, 8.0),
             glitch_metadata_csv=_write_pool(
                 tmp / "pool.csv",
@@ -460,6 +466,11 @@ class GwoscBuildIntegrationTests(unittest.TestCase):
     def test_background_domain_decoupled_and_groups_isolated(self):
         self.assertTrue(validate_background_domain_decoupled(self.meta))
         self.assertTrue(validate_no_background_group_leakage(self.meta))
+
+    def test_build_complete_marker_written(self):
+        """Completed+validated builds leave a BUILD_COMPLETE marker so
+        crashed partial runs can never be mistaken for datasets."""
+        self.assertTrue((self.cfg.output_dir / "BUILD_COMPLETE").exists())
 
     def test_dataset_config_records_pool_hash_and_code_commit(self):
         """D3: dataset_config.json must pin the pool contents and code commit."""
@@ -756,7 +767,8 @@ class OffSourceBuildConfigTests(unittest.TestCase):
     def test_transient_candidates_are_rejected_until_explicit_failure(self):
         """Every off-source candidate renders with a transient: the builder
         must retry up to max_background_attempts then raise -- never fall
-        back to synthetic noise."""
+        back to synthetic noise. (background_veto_max_pixels=0: any loud
+        pixel rejects, so the spiked mock is deterministically rejected.)"""
         from build_dataset import DatasetBuilder
 
         with tempfile.TemporaryDirectory() as td:
@@ -765,6 +777,7 @@ class OffSourceBuildConfigTests(unittest.TestCase):
                 tmp,
                 noise_source="gwosc",
                 max_background_attempts=2,
+                background_veto_max_pixels=0,
                 qtransform_backend="scipy",
                 glitch_metadata_csv=_write_pool(
                     tmp / "pool.csv",

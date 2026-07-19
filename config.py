@@ -396,12 +396,19 @@ class DatasetConfig:
     max_background_attempts: int = 20
     # Exclude off-source GPS within this many seconds of any known pool glitch.
     background_glitch_exclusion: float = 8.0
-    # Significance gate for the off-source transient veto: a candidate is
-    # rejected only when its render has pixels above this multiple of the
-    # median energy. Calibrated so clean-noise renders (peak/median <= ~12)
-    # pass while >=12 sigma transients (ratio >= ~100) are rejected; the
-    # label-time gate stays at glitch_box_from_ridge's default 5x.
-    background_veto_floor_gate: float = 15.0
+    # Off-source transient veto: reject a candidate whose render has MORE
+    # than background_veto_max_pixels pixels at or above
+    # background_veto_energy (normalized energy, 0-25 scale). Peak-based
+    # statistics cannot discriminate on real data (the energy clip
+    # saturates the peak for noise and glitches alike); the LOUD-PIXEL
+    # COUNT can. Calibrated 2026-07-18 on 160 real off-source + 80 real
+    # glitch segments: off-source n(E>=20) p50 ~ 150-210 / p90 ~ 1000,
+    # glitch p50 ~ 615-725 / p90 ~ 2700-7400. The default cuts the worst
+    # ~10% of off-source candidates while keeping typical real O1 noise
+    # texture -- the veto bounds transient energy, it does not (cannot)
+    # guarantee Gaussianity.
+    background_veto_energy: float = 20.0
+    background_veto_max_pixels: int = 1000
     # Spacing (s) of the deterministic off-source candidate grid inside each
     # 4096 s file (shared by prefetch_offsource_cache and the sampler).
     offsource_grid_step: float = 32.0
